@@ -1,4 +1,4 @@
-Analytics Workbench — Demo Package
+Analytics Workbench - — Demo Package
 
 What this is
 - A local analytics tool that queries Parquet files with DuckDB and exports results to Excel.
