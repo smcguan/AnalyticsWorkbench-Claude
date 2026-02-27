@@ -13,6 +13,8 @@ echo Building %APP_NAME%...
 echo Repo: %cd%
 echo =====================================================
 
+taskkill /IM AnalyticsWorkbench.exe /F >nul 2>&1
+
 REM --- 1) Ensure venv exists ---
 if not exist ".venv\Scripts\python.exe" (
   echo Creating virtual environment...
