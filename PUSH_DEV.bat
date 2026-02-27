@@ -1,6 +1,12 @@
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
 
+echo.
+echo Running in directory:
+echo %cd%
+echo.
+
+
 REM Go to repo root (folder this script lives in)
 cd /d "%~dp0"
 

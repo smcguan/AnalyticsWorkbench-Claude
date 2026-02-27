@@ -6,6 +6,11 @@ echo Analytics Workbench - Environment Doctor
 echo =========================================
 echo.
 
+echo.
+echo Running in directory:
+echo %cd%
+echo.
+
 echo Checking Python...
 where python
 python --version
