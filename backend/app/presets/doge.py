@@ -13,12 +13,19 @@ PRESETS = [
             GROUP BY HCPCS_CODE
             ORDER BY total_paid DESC
             LIMIT 500
-        """
+        """,
     },
     {
         "id": "hcpcs_over_threshold",
         "name": "HCPCS Over Threshold",
-        "params": {"threshold": 100000000},
+        "params": {
+            "threshold": {
+                "type": "number",
+                "label": "Minimum Total Paid",
+                "default": 100000000,
+                "required": False,
+            }
+        },
         "sql": """
             SELECT
                 HCPCS_CODE,
@@ -29,7 +36,7 @@ PRESETS = [
             GROUP BY HCPCS_CODE
             HAVING SUM(TOTAL_PAID) >= {threshold}
             ORDER BY total_paid DESC
-        """
+        """,
     },
     {
         "id": "column_count",
@@ -38,6 +45,6 @@ PRESETS = [
         "sql": """
             SELECT COUNT(*) AS column_count
             FROM (DESCRIBE SELECT * FROM dataset) t
-        """
+        """,
     },
 ]

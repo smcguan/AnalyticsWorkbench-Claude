@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import duckdb
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -19,6 +19,7 @@ from starlette.responses import FileResponse, Response
 from app.presets.doge import PRESETS  # noqa: E402
 
 import logging
+
 logger = logging.getLogger("app")
 
 app = FastAPI(title="Analytics Workbench")
@@ -127,18 +128,108 @@ def get_preset(preset_id: str) -> dict[str, Any] | None:
     return None
 
 
-def _sql_for(dataset: str, preset_id: str, threshold: int | None) -> tuple[str, str]:
+def _normalize_param_schema(raw_params: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    """
+    Supports:
+      - legacy defaults dict: {"threshold": 100000000}
+      - schema dict: {"threshold": {"type":"number","default":100000000,...}}
+    Returns schema dict keyed by param name.
+    """
+    raw_params = raw_params or {}
+    schema: dict[str, dict[str, Any]] = {}
+
+    for k, v in raw_params.items():
+        if isinstance(v, dict):
+            schema[k] = v
+        else:
+            # legacy scalar default
+            schema[k] = {
+                "type": "number" if isinstance(v, (int, float)) else "string",
+                "label": k,
+                "default": v,
+                "required": False,
+            }
+
+    return schema
+
+
+def _coerce_param(name: str, meta: dict[str, Any], value: Any) -> Any:
+    ptype = (meta.get("type") or "string").lower()
+
+    if value is None:
+        return None
+
+    if ptype == "number":
+        if isinstance(value, (int, float)):
+            return value
+        s = str(value).strip()
+        try:
+            # keep ints as int when possible
+            if s.isdigit() or (s.startswith("-") and s[1:].isdigit()):
+                return int(s)
+            return float(s)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Parameter '{name}' must be a number") from e
+
+    if ptype == "boolean":
+        if isinstance(value, bool):
+            return value
+        s = str(value).strip().lower()
+        if s in ("true", "1", "yes", "y", "on"):
+            return True
+        if s in ("false", "0", "no", "n", "off"):
+            return False
+        raise HTTPException(status_code=400, detail=f"Parameter '{name}' must be a boolean")
+
+    # string (and any unknown types) -> string
+    return str(value)
+
+
+def _build_final_params(preset_id: str, preset_def: dict[str, Any], provided_params: dict[str, Any]) -> dict[str, Any]:
+    schema = _normalize_param_schema(preset_def.get("params", {}) or {})
+
+    unknown = [k for k in provided_params.keys() if k not in schema]
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown parameter(s) for preset '{preset_id}': {', '.join(sorted(unknown))}",
+        )
+
+    final_params: dict[str, Any] = {}
+    for name, meta in schema.items():
+        required = bool(meta.get("required", False))
+        default = meta.get("default", None)
+
+        has_value = name in provided_params and provided_params[name] is not None and str(provided_params[name]) != ""
+        raw_val = provided_params[name] if has_value else default
+
+        if (raw_val is None or str(raw_val) == "") and required:
+            raise HTTPException(status_code=400, detail=f"Missing required parameter: {name}")
+
+        if raw_val is None:
+            final_params[name] = None
+            continue
+
+        final_params[name] = _coerce_param(name, meta, raw_val)
+
+    return final_params
+
+
+def _sql_for(dataset: str, preset_id: str, provided_params: dict[str, Any] | None = None) -> tuple[str, str]:
     preset_def = get_preset(preset_id)
     if not preset_def:
         raise HTTPException(status_code=400, detail=f"Unknown preset: {preset_id}")
 
     src, _is_glob = dataset_source_path(dataset)
 
-    final_params = dict(preset_def.get("params", {}))
-    if threshold is not None:
-        final_params["threshold"] = threshold
+    provided_params = provided_params or {}
+    final_params = _build_final_params(preset_id, preset_def, provided_params)
 
-    sql = preset_def["sql"].format(**final_params)
+    try:
+        sql = preset_def["sql"].format(**final_params)
+    except KeyError as e:
+        raise HTTPException(status_code=400, detail=f"Preset SQL missing parameter: {e}") from e
+
     # Replace placeholder token `dataset` with a parquet reader
     sql = sql.replace("dataset", f"read_parquet('{src}')")
     return sql, src
@@ -147,6 +238,22 @@ def _sql_for(dataset: str, preset_id: str, threshold: int | None) -> tuple[str, 
 def _connect() -> duckdb.DuckDBPyConnection:
     # Fileless connection is fine for query/extract workloads
     return duckdb.connect()
+
+
+def _extract_dynamic_params(request: Request, *, reserved: set[str], threshold_fallback: int | None) -> dict[str, Any]:
+    """
+    Pulls arbitrary query params (excluding reserved keys).
+    Keeps backward compatibility: if threshold_fallback is provided and not present in query params,
+    it is merged in as 'threshold'.
+    """
+    provided: dict[str, Any] = dict(request.query_params)
+    for k in reserved:
+        provided.pop(k, None)
+
+    if threshold_fallback is not None and "threshold" not in provided:
+        provided["threshold"] = threshold_fallback
+
+    return provided
 
 
 # ============================================================
@@ -239,6 +346,7 @@ def api_schema(dataset: str = Query(...)):
         logger.exception("schema failed | dataset=%s src=%s", dataset, src)
         raise HTTPException(status_code=500, detail=f"Schema introspection failed: {e}")
 
+
 @app.get("/api/dialog/folder")
 def api_dialog_folder():
     """
@@ -260,14 +368,21 @@ def api_dialog_folder():
 
 @app.get("/api/run")
 def api_run(
+    request: Request,
     dataset: str = Query(...),
     preset: str = Query(...),
     threshold: int | None = None,
 ):
-    logger.info("query requested | dataset=%s preset=%s threshold=%s", dataset, preset, threshold)
+    provided_params = _extract_dynamic_params(
+        request,
+        reserved={"dataset", "preset"},
+        threshold_fallback=threshold,
+    )
+
+    logger.info("query requested | dataset=%s preset=%s params=%s", dataset, preset, provided_params)
     t0 = time.perf_counter()
     try:
-        sql, _src = _sql_for(dataset, preset, threshold)
+        sql, _src = _sql_for(dataset, preset, provided_params)
 
         con = _connect()
         try:
@@ -300,14 +415,21 @@ def api_run(
 
 @app.get("/api/export")
 def api_export(
+    request: Request,
     dataset: str = Query(...),
     preset: str = Query(...),
     threshold: int | None = None,
 ):
-    logger.info("export requested | dataset=%s preset=%s threshold=%s", dataset, preset, threshold)
+    provided_params = _extract_dynamic_params(
+        request,
+        reserved={"dataset", "preset"},
+        threshold_fallback=threshold,
+    )
+
+    logger.info("export requested | dataset=%s preset=%s params=%s", dataset, preset, provided_params)
     t0 = time.perf_counter()
     try:
-        sql, _src = _sql_for(dataset, preset, threshold)
+        sql, _src = _sql_for(dataset, preset, provided_params)
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         safe_preset = preset.replace("/", "_").replace("\\", "_")
@@ -426,9 +548,6 @@ def register_dataset(req: RegisterRequest):
     logger.info("register success | dataset=%s storage=%s elapsed=%s", ds_name, storage, elapsed)
     return {"dataset": ds_name, "storage": storage}
 
-from fastapi import BackgroundTasks
-import os
-import time
 
 @app.post("/api/shutdown")
 def api_shutdown(bg: BackgroundTasks):
@@ -437,6 +556,7 @@ def api_shutdown(bg: BackgroundTasks):
     Windows + PyInstaller + --noconsole: SIGTERM is not reliable, so we force exit.
     """
     logger.info("shutdown requested")
+
     def _stop():
         time.sleep(0.25)  # let the HTTP response flush
         os._exit(0)       # guaranteed process termination

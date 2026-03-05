@@ -59,47 +59,43 @@
       display:flex; gap:14px; align-items:center;
     }
 
-/* ---------- Logo Badge ---------- */
-.logo{
-  width:46px;
-  height:46px;
-  border-radius:50%;
-  overflow:hidden;
-  position:relative;
-  background:#fff;
-  display:flex;
-  align-items:center;
-  justify-content:center;
+    /* ---------- Logo Badge ---------- */
+    .logo{
+      width:46px;
+      height:46px;
+      border-radius:50%;
+      overflow:hidden;
+      position:relative;
+      background:#fff;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      box-shadow: 0 6px 16px rgba(0,0,0,.25);
+    }
 
-  /* overall shadow */
-  box-shadow: 0 6px 16px rgba(0,0,0,.25);
-}
+    .logo img{
+      width:100%;
+      height:100%;
+      object-fit:cover;
+      transform: scale(1.30) translateY(1px);
+      transform-origin:center;
+      display:block;
+    }
 
-/* Icon fill + slight nudge so the head isn't clipped */
-.logo img{
-  width:100%;
-  height:100%;
-  object-fit:cover;
-  transform: scale(1.30) translateY(1px); /* tweak these */
-  transform-origin:center;
-  display:block;
-}
+    .logo::after{
+      content:"";
+      position:absolute;
+      inset:0;
+      border-radius:50%;
+      pointer-events:none;
+      box-shadow:
+        inset 0 0 0 2px rgba(255,255,255,.92),
+        inset 0 0 0 4px rgba(180,190,205,.75),
+        inset 0 2px 6px rgba(255,255,255,.55),
+        inset 0 -3px 8px rgba(0,0,0,.25);
+    }
 
-/* Shiny silver ring overlay (doesn't shrink the icon) */
-.logo::after{
-  content:"";
-  position:absolute;
-  inset:0;
-  border-radius:50%;
-  pointer-events:none;
-
-  /* ring + highlight */
-  box-shadow:
-    inset 0 0 0 2px rgba(255,255,255,.92),     /* inner bright rim */
-    inset 0 0 0 4px rgba(180,190,205,.75),     /* silver body */
-    inset 0 2px 6px rgba(255,255,255,.55),     /* top highlight */
-    inset 0 -3px 8px rgba(0,0,0,.25);          /* bottom shade */
-}    .brand .sub{
+    .brand .sub{
       font-size: 12px;
       color: var(--muted2);
       margin-top:2px;
@@ -203,7 +199,7 @@
       font-size: 12px;
       color: var(--muted2);
     }
-    input[type="text"], select{
+    input[type="text"], input[type="number"], select{
       height: 38px;
       border-radius: 12px;
       border:1px solid rgba(255,255,255,.12);
@@ -213,7 +209,7 @@
       outline:none;
       font-size: 13px;
     }
-    input[type="text"]::placeholder{ color: rgba(232,238,252,.35); }
+    input[type="text"]::placeholder, input[type="number"]::placeholder{ color: rgba(232,238,252,.35); }
     select{ padding-right: 30px; }
 
     .checkbox{
@@ -342,10 +338,7 @@
             <select id="presetSelect"></select>
           </div>
 
-          <div class="field" style="min-width:200px;">
-            <label for="thresholdInput">Threshold (optional)</label>
-            <input id="thresholdInput" type="text" placeholder="e.g. 100000000" />
-          </div>
+          <div id="dynamicParams" class="row"></div>
         </div>
 
         <div class="row" style="margin-top:12px;">
@@ -482,6 +475,7 @@
     // State
     // -----------------------------
     let lastRun = { columns: [], rows: [], rowcount: 0, elapsed: 0 };
+    let presets = []; // <-- 4B: store preset definitions including param schema
 
     // -----------------------------
     // Version + init
@@ -524,19 +518,82 @@
       }
     }
 
+    function renderPresetParams() {
+      const presetId = $("presetSelect").value;
+      const container = $("dynamicParams");
+      container.innerHTML = "";
+
+      const preset = presets.find(p => p.id === presetId);
+      if (!preset || !preset.params) return;
+
+      const entries = Object.entries(preset.params);
+      if (!entries.length) return;
+
+      for (const [name, meta] of entries) {
+        const field = document.createElement("div");
+        field.className = "field";
+        field.style.minWidth = "200px";
+
+        const label = document.createElement("label");
+        label.setAttribute("for", "param_" + name);
+        label.textContent = (meta && meta.label) ? meta.label : name;
+
+        const input = document.createElement("input");
+        const ptype = (meta && meta.type) ? String(meta.type).toLowerCase() : "string";
+        input.type = (ptype === "number") ? "number" : "text";
+        input.id = "param_" + name;
+
+        const def = meta ? meta.default : "";
+        if (def !== undefined && def !== null) {
+          input.value = String(def);
+          input.placeholder = String(def);
+        } else {
+          input.value = "";
+          input.placeholder = "";
+        }
+
+        // Optional: basic client-side required hinting
+        if (meta && meta.required === true) input.required = true;
+
+        field.appendChild(label);
+        field.appendChild(input);
+        container.appendChild(field);
+      }
+    }
+
+    function buildDynamicParamsForSelectedPreset() {
+      const presetId = $("presetSelect").value;
+      const preset = presets.find(p => p.id === presetId);
+      const params = new URLSearchParams();
+
+      if (!preset || !preset.params) return params;
+
+      for (const name of Object.keys(preset.params)) {
+        const input = $("param_" + name);
+        if (!input) continue;
+        const val = String(input.value || "").trim();
+        if (val !== "") params.set(name, val);
+      }
+      return params;
+    }
+
     async function loadPresets() {
       const sel = $("presetSelect");
       sel.innerHTML = "";
       try {
         const data = await apiJson("/api/presets");
-        const arr = data.presets || [];
-        for (const p of arr) {
+        presets = data.presets || [];
+
+        for (const p of presets) {
           const opt = document.createElement("option");
           opt.value = p.id;
           opt.textContent = p.name || p.id;
           sel.appendChild(opt);
         }
+
+        renderPresetParams();
       } catch (e) {
+        presets = [];
         const opt = document.createElement("option");
         opt.value = "";
         opt.textContent = "(failed to load presets)";
@@ -722,28 +779,36 @@
     async function runQuery() {
       const dataset = $("datasetSelect").value;
       const preset = $("presetSelect").value;
-      const thresholdRaw = $("thresholdInput").value.trim();
-      const threshold = thresholdRaw ? Number(thresholdRaw) : null;
 
-      if (!dataset) {
-        toast("Select a dataset first.");
-        return;
-      }
-      if (!preset) {
-        toast("Select a preset first.");
-        return;
-      }
-      if (thresholdRaw && Number.isNaN(threshold)) {
-        toast("Threshold must be a number.");
-        return;
+      if (!dataset) { toast("Select a dataset first."); return; }
+      if (!preset) { toast("Select a preset first."); return; }
+
+      // Build query string using dynamic params
+      const params = new URLSearchParams({ dataset, preset });
+      const dyn = buildDynamicParamsForSelectedPreset();
+      for (const [k, v] of dyn.entries()) params.set(k, v);
+
+      // Minimal client-side numeric validation (server is source of truth)
+      const presetDef = presets.find(p => p.id === preset);
+      if (presetDef && presetDef.params) {
+        for (const [name, meta] of Object.entries(presetDef.params)) {
+          const ptype = (meta && meta.type) ? String(meta.type).toLowerCase() : "string";
+          if (ptype === "number") {
+            const input = $("param_" + name);
+            if (input) {
+              const val = String(input.value || "").trim();
+              if (val !== "" && Number.isNaN(Number(val))) {
+                toast(`${(meta && meta.label) ? meta.label : name} must be a number.`);
+                return;
+              }
+            }
+          }
+        }
       }
 
       try {
         setRunStatus("warn", "Running…");
         $("resultsWrap").style.display = "none";
-
-        const params = new URLSearchParams({ dataset, preset });
-        if (threshold !== null) params.set("threshold", String(threshold));
 
         const data = await apiJson("/api/run?" + params.toString());
         lastRun = {
@@ -754,7 +819,6 @@
         };
 
         renderResults(lastRun.columns, lastRun.rows);
-
         setRunStatus("ok", `Rows: ${num(lastRun.rowcount)} • Preview: ${num(lastRun.rows.length)} • ${lastRun.elapsed}s`);
       } catch (e) {
         setRunStatus("bad", "Run failed.");
@@ -796,17 +860,14 @@
     function exportExcel() {
       const dataset = $("datasetSelect").value;
       const preset = $("presetSelect").value;
-      const thresholdRaw = $("thresholdInput").value.trim();
-      const threshold = thresholdRaw ? Number(thresholdRaw) : null;
 
       if (!dataset) { toast("Select a dataset first."); return; }
       if (!preset) { toast("Select a preset first."); return; }
-      if (thresholdRaw && Number.isNaN(threshold)) { toast("Threshold must be a number."); return; }
 
       const params = new URLSearchParams({ dataset, preset });
-      if (threshold !== null) params.set("threshold", String(threshold));
+      const dyn = buildDynamicParamsForSelectedPreset();
+      for (const [k, v] of dyn.entries()) params.set(k, v);
 
-      // download in browser
       window.location.href = "/api/export?" + params.toString();
       toast("Export started (check exports folder if needed).");
     }
@@ -821,7 +882,6 @@
         // ignore
       }
       toast("Shutting down…");
-      // window.close may be blocked; but server will exit so relaunch works.
       setTimeout(() => { try { window.close(); } catch(e) {} }, 250);
     }
 
@@ -838,6 +898,9 @@
     $("exportBtn").addEventListener("click", exportExcel);
 
     $("quitBtn").addEventListener("click", quitApp);
+
+    // 4B: rerender params whenever preset changes
+    $("presetSelect").addEventListener("change", renderPresetParams);
 
     // -----------------------------
     // Init
