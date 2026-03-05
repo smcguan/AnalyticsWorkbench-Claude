@@ -31,7 +31,7 @@ app = FastAPI(title="Analytics Workbench")
 def app_base_dir() -> Path:
     """
     Packaged: folder containing the EXE
-    Dev: repo root (…/Analytics Workbench)
+    Dev: repo root (.../Analytics Workbench)
     """
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
@@ -49,7 +49,13 @@ EXPORTS_DIR = Path(os.getenv("AW_EXPORTS_DIR", str(BASE_DIR / "exports")))
 DATASETS_DIR.mkdir(parents=True, exist_ok=True)
 EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
-# Startup confirmation — logged once at import time
+# ============================================================
+# Query guardrails (single-point configuration)
+# ============================================================
+MAX_PREVIEW_ROWS = 200
+MAX_EXPORT_ROWS = 2_000_000
+
+# Startup confirmation - logged once at import time
 logger.info(
     "app started | mode=%s | exports_dir=%s",
     "packaged" if getattr(sys, "frozen", False) else "dev",
@@ -302,10 +308,7 @@ def api_datasets():
 @app.get("/api/presets")
 def api_presets():
     return {
-        "presets": [
-            {"id": p["id"], "name": p["name"], "params": p.get("params", {})}
-            for p in PRESETS
-        ]
+        "presets": [{"id": p["id"], "name": p["name"], "params": p.get("params", {})} for p in PRESETS]
     }
 
 
@@ -332,71 +335,14 @@ def api_schema(dataset: str = Query(...)):
             con.close()
 
         elapsed = round(time.perf_counter() - t0, 4)
-        logger.info(
-            "schema success | dataset=%s columns=%d elapsed=%s",
-            dataset, len(columns), elapsed
-        )
+        logger.info("schema success | dataset=%s columns=%d elapsed=%s", dataset, len(columns), elapsed)
         return {"dataset": dataset, "columns": columns}
 
     except HTTPException:
         raise
     except Exception as e:
-        # Surface the actual failure in the response so you can see it in-browser
-        # even in --noconsole packaged mode.
         logger.exception("schema failed | dataset=%s src=%s", dataset, src)
         raise HTTPException(status_code=500, detail=f"Schema introspection failed: {e}")
-
-
-@app.get("/api/explain")
-def api_explain(
-    request: Request,
-    dataset: str = Query(...),
-    preset: str = Query(...),
-    threshold: int | None = None,
-):
-    provided_params = _extract_dynamic_params(
-        request,
-        reserved={"dataset", "preset"},
-        threshold_fallback=threshold,
-    )
-
-    logger.info(
-        "explain requested | dataset=%s preset=%s params=%s",
-        dataset, preset, provided_params,
-    )
-    t0 = time.perf_counter()
-
-    try:
-        sql, _src = _sql_for(dataset, preset, provided_params)
-
-        con = _connect()
-        try:
-            rows = con.execute(f"EXPLAIN {sql}").fetchall()
-            plan = "\n".join(str(r[1]) for r in rows if r[1] is not None)
-        finally:
-            con.close()
-
-        elapsed = round(time.perf_counter() - t0, 4)
-        logger.info(
-            "explain success | dataset=%s preset=%s params=%s elapsed=%s",
-            dataset, preset, provided_params, elapsed,
-        )
-        return {
-            "dataset": dataset,
-            "preset": preset,
-            "params": provided_params,
-            "sql": sql,
-            "explain": plan,
-        }
-
-    except HTTPException:
-        raise
-    except FileNotFoundError as e:
-        logger.warning("explain failed | dataset=%s | reason=%s", dataset, e)
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception:
-        logger.exception("explain failed | dataset=%s preset=%s params=%s", dataset, preset, provided_params)
-        raise
 
 
 @app.get("/api/dialog/folder")
@@ -436,19 +382,27 @@ def api_run(
     try:
         sql, _src = _sql_for(dataset, preset, provided_params)
 
+        limited_sql = f"SELECT * FROM ({sql}) t LIMIT {MAX_PREVIEW_ROWS}"
+
         con = _connect()
         try:
-            cur = con.execute(sql)
+            cur = con.execute(limited_sql)
             cols = [d[0] for d in cur.description]
-            rows = cur.fetchmany(200)
+            rows = cur.fetchmany(MAX_PREVIEW_ROWS)
 
             rowcount = int(con.execute(f"SELECT COUNT(*) FROM ({sql}) t").fetchone()[0])
             elapsed = time.perf_counter() - t0
 
             preview = [dict(zip(cols, r)) for r in rows]
             logger.info(
-                "query success | dataset=%s preset=%s rowcount=%d preview=%d elapsed=%s",
-                dataset, preset, rowcount, len(preview), round(elapsed, 4),
+                "query success | dataset=%s preset=%s params=%s preview_limit=%d rows_returned=%d rowcount=%d elapsed=%s",
+                dataset,
+                preset,
+                provided_params,
+                MAX_PREVIEW_ROWS,
+                len(preview),
+                rowcount,
+                round(elapsed, 4),
             )
             return {
                 "columns": cols,
@@ -461,7 +415,7 @@ def api_run(
     except HTTPException:
         raise
     except Exception:
-        logger.exception("query failed | dataset=%s preset=%s", dataset, preset)
+        logger.exception("query failed | dataset=%s preset=%s params=%s", dataset, preset, provided_params)
         raise
 
 
@@ -493,13 +447,43 @@ def api_export(
 
         con = _connect()
         try:
+            estimated_rows = int(con.execute(f"SELECT COUNT(*) FROM ({sql}) t").fetchone()[0])
+            if estimated_rows > MAX_EXPORT_ROWS:
+                elapsed = round(time.perf_counter() - t0, 4)
+                logger.warning(
+                    "export aborted | dataset=%s preset=%s params=%s estimated_rows=%d max_export_rows=%d elapsed=%s",
+                    dataset,
+                    preset,
+                    provided_params,
+                    estimated_rows,
+                    MAX_EXPORT_ROWS,
+                    elapsed,
+                )
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": "Export exceeds maximum allowed rows",
+                        "max_export_rows": MAX_EXPORT_ROWS,
+                        "estimated_rows": estimated_rows,
+                    },
+                )
+
             con.execute("CREATE OR REPLACE TEMP VIEW __export_view AS " + sql)
 
             try:
                 out_str = str(out_xlsx.resolve()).replace("\\", "/")
                 con.execute(f"COPY __export_view TO '{out_str}' (FORMAT XLSX, HEADER TRUE)")
                 elapsed = round(time.perf_counter() - t0, 4)
-                logger.info("export success | file=%s path=%s elapsed=%s", out_xlsx.name, out_xlsx, elapsed)
+                logger.info(
+                    "export success | dataset=%s preset=%s params=%s rows_exported=%d file=%s path=%s elapsed=%s",
+                    dataset,
+                    preset,
+                    provided_params,
+                    estimated_rows,
+                    out_xlsx.name,
+                    out_xlsx,
+                    elapsed,
+                )
                 return FileResponse(
                     path=str(out_xlsx),
                     filename=out_xlsx.name,
@@ -510,7 +494,16 @@ def api_export(
                 out_str = str(out_csv.resolve()).replace("\\", "/")
                 con.execute(f"COPY __export_view TO '{out_str}' (FORMAT CSV, HEADER TRUE)")
                 elapsed = round(time.perf_counter() - t0, 4)
-                logger.info("export success (csv fallback) | file=%s path=%s elapsed=%s", out_csv.name, out_csv, elapsed)
+                logger.info(
+                    "export success (csv fallback) | dataset=%s preset=%s params=%s rows_exported=%d file=%s path=%s elapsed=%s",
+                    dataset,
+                    preset,
+                    provided_params,
+                    estimated_rows,
+                    out_csv.name,
+                    out_csv,
+                    elapsed,
+                )
                 return FileResponse(
                     path=str(out_csv),
                     filename=out_csv.name,
@@ -521,7 +514,7 @@ def api_export(
     except HTTPException:
         raise
     except Exception:
-        logger.exception("export failed | dataset=%s preset=%s", dataset, preset)
+        logger.exception("export failed | dataset=%s preset=%s params=%s", dataset, preset, provided_params)
         raise
 
 
@@ -548,9 +541,7 @@ def scan_for_parquet(req: ScanRequest):
             try:
                 # parquet_metadata provides num_rows per row-group
                 row_count = int(
-                    con.execute(
-                        f"SELECT COALESCE(SUM(num_rows), 0) FROM parquet_metadata('{f_str}')"
-                    ).fetchone()[0]
+                    con.execute(f"SELECT COALESCE(SUM(num_rows), 0) FROM parquet_metadata('{f_str}')").fetchone()[0]
                 )
             except Exception:
                 row_count = None
@@ -574,7 +565,12 @@ def scan_for_parquet(req: ScanRequest):
 @app.post("/api/datasets/register")
 def register_dataset(req: RegisterRequest):
     t0 = time.perf_counter()
-    logger.info("register requested | dataset=%s parquet_path=%s mode=%s", req.dataset_name, req.parquet_path, req.mode)
+    logger.info(
+        "register requested | dataset=%s parquet_path=%s mode=%s",
+        req.dataset_name,
+        req.parquet_path,
+        req.mode,
+    )
     src = Path(req.parquet_path).expanduser()
     if not src.exists() or not src.is_file():
         logger.warning("register failed | dataset=%s | reason=parquet path not found", req.dataset_name)
@@ -611,7 +607,8 @@ def api_shutdown(bg: BackgroundTasks):
 
     def _stop():
         time.sleep(0.25)  # let the HTTP response flush
-        os._exit(0)       # guaranteed process termination
+        os._exit(0)  # guaranteed process termination
 
     bg.add_task(_stop)
     return {"ok": True}
+
