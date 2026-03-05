@@ -202,6 +202,43 @@ def api_presets():
     }
 
 
+@app.get("/api/schema")
+def api_schema(dataset: str = Query(...)):
+    logger.info("schema requested | dataset=%s", dataset)
+    t0 = time.perf_counter()
+
+    try:
+        src, _is_glob = dataset_source_path(dataset)
+    except FileNotFoundError as e:
+        logger.warning("schema failed | dataset=%s | reason=%s", dataset, e)
+        raise HTTPException(status_code=404, detail=str(e))
+
+    try:
+        con = _connect()
+        try:
+            # Use DESCRIBE to get schema rows directly (name/type as strings),
+            # and bind the parquet path to avoid quoting/path issues.
+            cur = con.execute("DESCRIBE SELECT * FROM read_parquet(?)", [src])
+            rows = cur.fetchall()
+            columns = [{"name": r[0], "type": str(r[1])} for r in rows]
+        finally:
+            con.close()
+
+        elapsed = round(time.perf_counter() - t0, 4)
+        logger.info(
+            "schema success | dataset=%s columns=%d elapsed=%s",
+            dataset, len(columns), elapsed
+        )
+        return {"dataset": dataset, "columns": columns}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Surface the actual failure in the response so you can see it in-browser
+        # even in --noconsole packaged mode.
+        logger.exception("schema failed | dataset=%s src=%s", dataset, src)
+        raise HTTPException(status_code=500, detail=f"Schema introspection failed: {e}")
+
 @app.get("/api/dialog/folder")
 def api_dialog_folder():
     """

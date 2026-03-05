@@ -37,7 +37,7 @@ PRESETS = [
         "params": {},
         "sql": """
             SELECT COUNT(*) AS column_count
-            FROM parquet_schema(dataset)
+            FROM (DESCRIBE SELECT * FROM dataset) t
         """
     },
 ]
