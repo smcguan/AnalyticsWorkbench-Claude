@@ -43,6 +43,7 @@ FRONTEND_DIR = Path(os.getenv("AW_FRONTEND_DIR", str(BASE_DIR / "frontend")))
 DATA_DIR = Path(os.getenv("AW_DATA_DIR", str(BASE_DIR / "data")))
 DATASETS_DIR = Path(os.getenv("AW_DATASETS_DIR", str(DATA_DIR / "datasets")))
 EXPORTS_DIR = Path(os.getenv("AW_EXPORTS_DIR", str(BASE_DIR / "exports")))
+QUERIES_PATH = Path(os.getenv("AW_QUERIES_PATH", str(DATA_DIR / "queries.json")))
 
 DATASETS_DIR.mkdir(parents=True, exist_ok=True)
 EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -131,6 +132,17 @@ class RegisterRequest(BaseModel):
     dataset_name: str
     parquet_path: str
     mode: str = "reference"  # "reference" or "copy"
+
+
+class SaveQueryRequest(BaseModel):
+    name: str
+    dataset: str
+    preset: str
+    params: dict[str, Any] = {}
+
+
+class DeleteQueryRequest(BaseModel):
+    name: str
 
 
 # ============================================================
@@ -266,14 +278,11 @@ def _dataset_meta_summary(dataset: str) -> dict[str, Any]:
 
     con = _connect()
     try:
-
-
         row_count = int(
             con.execute(
-                f"SELECT COUNT(*) FROM read_parquet('{esc}')"
+                f"SELECT COALESCE(SUM(num_rows), 0) FROM parquet_metadata('{esc}')"
             ).fetchone()[0]
         )
-
 
         # parquet_schema() returns one row per column
         column_count = int(
@@ -386,6 +395,55 @@ def _sql_for(dataset: str, preset_id: str, provided_params: dict[str, Any]) -> t
     sql = sql.replace("dataset", f"read_parquet('{esc}')")
 
     return sql, src
+
+
+def _normalize_saved_query_name(name: str) -> str:
+    return (name or "").strip()
+
+
+def _load_saved_queries() -> list[dict[str, Any]]:
+    if not QUERIES_PATH.exists():
+        return []
+
+    try:
+        raw = json.loads(QUERIES_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        logger.warning("queries.json load failed | path=%s", QUERIES_PATH)
+        return []
+
+    items = raw.get("queries", []) if isinstance(raw, dict) else []
+    out: list[dict[str, Any]] = []
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+
+        name = _normalize_saved_query_name(str(item.get("name", "")))
+        dataset = str(item.get("dataset", "")).strip()
+        preset = str(item.get("preset", "")).strip()
+        params = item.get("params", {})
+
+        if not name or not dataset or not preset:
+            continue
+        if not isinstance(params, dict):
+            params = {}
+
+        out.append(
+            {
+                "name": name,
+                "dataset": dataset,
+                "preset": preset,
+                "params": params,
+            }
+        )
+
+    return out
+
+
+def _save_saved_queries(items: list[dict[str, Any]]) -> None:
+    QUERIES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"queries": items}
+    QUERIES_PATH.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 # ============================================================
@@ -590,6 +648,84 @@ def api_presets():
             for p in PRESETS
         ]
     }
+
+
+@app.get("/api/queries")
+def api_queries():
+    queries = _load_saved_queries()
+    return {"queries": queries}
+
+
+@app.post("/api/queries/save")
+def api_queries_save(req: SaveQueryRequest):
+    name = _normalize_saved_query_name(req.name)
+    if not name:
+        raise HTTPException(status_code=400, detail="Query name is required.")
+
+    if req.dataset not in list_datasets():
+        raise HTTPException(status_code=404, detail=f"Dataset not found: {req.dataset}")
+
+    if not get_preset(req.preset):
+        raise HTTPException(status_code=400, detail=f"Unknown preset: {req.preset}")
+
+    params = req.params if isinstance(req.params, dict) else {}
+    items = _load_saved_queries()
+
+    record = {
+        "name": name,
+        "dataset": req.dataset,
+        "preset": req.preset,
+        "params": params,
+    }
+
+    replaced = False
+    for i, item in enumerate(items):
+        if item.get("name") == name:
+            items[i] = record
+            replaced = True
+            break
+    if not replaced:
+        items.append(record)
+
+    _save_saved_queries(items)
+
+    _audit_log(
+        {
+            "event": "query_saved",
+            "status": "success",
+            "name": name,
+            "dataset": req.dataset,
+            "preset": req.preset,
+            "params": params,
+        }
+    )
+
+    return {"ok": True, "saved_query": record, "replaced": replaced}
+
+
+@app.post("/api/queries/delete")
+def api_queries_delete(req: DeleteQueryRequest):
+    name = _normalize_saved_query_name(req.name)
+    if not name:
+        raise HTTPException(status_code=400, detail="Query name is required.")
+
+    items = _load_saved_queries()
+    kept = [item for item in items if item.get("name") != name]
+
+    if len(kept) == len(items):
+        raise HTTPException(status_code=404, detail=f"Saved query not found: {name}")
+
+    _save_saved_queries(kept)
+
+    _audit_log(
+        {
+            "event": "query_deleted",
+            "status": "success",
+            "name": name,
+        }
+    )
+
+    return {"ok": True, "deleted": name}
 
 
 @app.get("/api/audit")
