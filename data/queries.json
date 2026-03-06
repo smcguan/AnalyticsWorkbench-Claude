@@ -1,0 +1,11 @@
+{
+  "queries": [
+    {
+      "name": "hcpcs_summary - NewDataset",
+      "type": "preset",
+      "dataset": "NewDataset",
+      "preset": "hcpcs_summary",
+      "params": {}
+    }
+  ]
+}

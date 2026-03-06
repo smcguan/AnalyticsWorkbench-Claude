@@ -139,12 +139,19 @@ class RegisterRequest(BaseModel):
 class SaveQueryRequest(BaseModel):
     name: str
     dataset: str
-    preset: str
+    type: str = "preset"
+    preset: str | None = None
+    sql: str | None = None
     params: dict[str, Any] = {}
 
 
 class DeleteQueryRequest(BaseModel):
     name: str
+
+
+class SqlRequest(BaseModel):
+    dataset: str
+    sql: str
 
 
 # ============================================================
@@ -421,23 +428,33 @@ def _load_saved_queries() -> list[dict[str, Any]]:
             continue
 
         name = _normalize_saved_query_name(str(item.get("name", "")))
+        qtype = str(item.get("type", "preset")).strip().lower() or "preset"
         dataset = str(item.get("dataset", "")).strip()
         preset = str(item.get("preset", "")).strip()
+        sql = str(item.get("sql", "")).strip()
         params = item.get("params", {})
 
-        if not name or not dataset or not preset:
+        if not name or not dataset:
+            continue
+        if qtype == "preset" and not preset:
+            continue
+        if qtype == "sql" and not sql:
             continue
         if not isinstance(params, dict):
             params = {}
 
-        out.append(
-            {
-                "name": name,
-                "dataset": dataset,
-                "preset": preset,
-                "params": params,
-            }
-        )
+        record = {
+            "name": name,
+            "type": qtype,
+            "dataset": dataset,
+            "params": params,
+        }
+        if qtype == "preset":
+            record["preset"] = preset
+        else:
+            record["sql"] = sql
+
+        out.append(record)
 
     return out
 
@@ -446,6 +463,23 @@ def _save_saved_queries(items: list[dict[str, Any]]) -> None:
     QUERIES_PATH.parent.mkdir(parents=True, exist_ok=True)
     payload = {"queries": items}
     QUERIES_PATH.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def _validate_readonly_sql(sql: str) -> str:
+    s = (sql or "").strip()
+    if not s:
+        raise HTTPException(status_code=400, detail="SQL is required.")
+
+    lowered = s.lower()
+    if not (lowered.startswith("select") or lowered.startswith("with")):
+        raise HTTPException(status_code=400, detail="Only SELECT and WITH queries are allowed.")
+
+    blocked = ["insert", "update", "delete", "drop", "alter", "create", "copy", "attach", "detach"]
+    for token in blocked:
+        if re.search(rf"\b{token}\b", lowered):
+            raise HTTPException(status_code=400, detail=f"Blocked SQL keyword: {token}")
+
+    return s
 
 
 # ============================================================
@@ -667,18 +701,33 @@ def api_queries_save(req: SaveQueryRequest):
     if req.dataset not in list_datasets():
         raise HTTPException(status_code=404, detail=f"Dataset not found: {req.dataset}")
 
-    if not get_preset(req.preset):
-        raise HTTPException(status_code=400, detail=f"Unknown preset: {req.preset}")
-
+    qtype = (req.type or "preset").strip().lower()
     params = req.params if isinstance(req.params, dict) else {}
     items = _load_saved_queries()
 
-    record = {
-        "name": name,
-        "dataset": req.dataset,
-        "preset": req.preset,
-        "params": params,
-    }
+    if qtype == "preset":
+        preset = (req.preset or "").strip()
+        if not get_preset(preset):
+            raise HTTPException(status_code=400, detail=f"Unknown preset: {preset}")
+
+        record = {
+            "name": name,
+            "type": "preset",
+            "dataset": req.dataset,
+            "preset": preset,
+            "params": params,
+        }
+    elif qtype == "sql":
+        sql = _validate_readonly_sql(req.sql or "")
+        record = {
+            "name": name,
+            "type": "sql",
+            "dataset": req.dataset,
+            "sql": sql,
+            "params": {},
+        }
+    else:
+        raise HTTPException(status_code=400, detail="Query type must be 'preset' or 'sql'.")
 
     replaced = False
     for i, item in enumerate(items):
@@ -697,8 +746,7 @@ def api_queries_save(req: SaveQueryRequest):
             "status": "success",
             "name": name,
             "dataset": req.dataset,
-            "preset": req.preset,
-            "params": params,
+            "query_type": record["type"],
         }
     )
 
@@ -728,6 +776,75 @@ def api_queries_delete(req: DeleteQueryRequest):
     )
 
     return {"ok": True, "deleted": name}
+
+
+@app.post("/api/sql")
+def api_sql(req: SqlRequest):
+    t0 = time.perf_counter()
+
+    try:
+        if req.dataset not in list_datasets():
+            raise HTTPException(status_code=404, detail=f"Dataset not found: {req.dataset}")
+
+        validated_sql = _validate_readonly_sql(req.sql)
+        src, _is_glob = dataset_source_path(req.dataset)
+        esc = _sql_escape_path(src)
+
+        sql = validated_sql.replace("dataset", f"read_parquet('{esc}')")
+        limited_sql = f"SELECT * FROM ({sql}) t LIMIT {MAX_PREVIEW_ROWS}"
+
+        con = _connect()
+        try:
+            cur = con.execute(limited_sql)
+            cols = [d[0] for d in cur.description]
+            rows = cur.fetchall()
+            rowcount = int(con.execute(f"SELECT COUNT(*) FROM ({sql}) t").fetchone()[0])
+        finally:
+            con.close()
+
+        preview = [dict(zip(cols, r)) for r in rows]
+        elapsed = round(time.perf_counter() - t0, 4)
+
+        _audit_log(
+            {
+                "event": "sql",
+                "status": "success",
+                "dataset": req.dataset,
+                "rowcount": rowcount,
+                "preview_rows_returned": len(preview),
+                "elapsed_seconds": elapsed,
+            }
+        )
+
+        return {
+            "columns": cols,
+            "rows": preview,
+            "rowcount": rowcount,
+            "elapsed_seconds": elapsed,
+        }
+
+    except HTTPException as e:
+        _audit_log(
+            {
+                "event": "sql",
+                "status": "error",
+                "dataset": req.dataset,
+                "error": str(e.detail),
+            }
+        )
+        raise
+
+    except Exception as e:
+        logger.exception("sql failed | dataset=%s", req.dataset)
+        _audit_log(
+            {
+                "event": "sql",
+                "status": "error",
+                "dataset": req.dataset,
+                "error": str(e),
+            }
+        )
+        raise
 
 
 @app.get("/api/audit")
