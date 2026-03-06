@@ -101,6 +101,12 @@
       margin-top:2px;
     }
 
+    .subtitle2{
+      font-size:12px;
+      color:var(--muted2);
+      margin-top:4px;
+    }
+
     .rightbar{
       display:flex; gap:10px; align-items:center;
     }
@@ -165,7 +171,7 @@
 
     .grid{
       display:grid;
-      grid-template-columns: 1fr 1.35fr;
+      grid-template-columns: 40% 60%;
       gap: 18px;
       margin-top: 18px;
       align-items:start;
@@ -182,6 +188,58 @@
       box-shadow: var(--shadow);
       backdrop-filter: blur(12px);
       padding: var(--pad);
+    }
+
+
+    .subtle-note{
+      margin: -4px 0 14px 0;
+      color: var(--muted2);
+      font-size: 12px;
+      line-height: 1.4;
+    }
+
+    .section-toolbar{
+      display:flex;
+      justify-content:space-between;
+      align-items:center;
+      gap:10px;
+      margin-bottom:12px;
+      flex-wrap:wrap;
+    }
+
+    .mini-badges{
+      display:flex;
+      gap:8px;
+      flex-wrap:wrap;
+    }
+
+    .mini-badge{
+      font-size:11px;
+      color: var(--muted);
+      border:1px solid rgba(255,255,255,.10);
+      background: rgba(255,255,255,.04);
+      border-radius:999px;
+      padding:5px 8px;
+    }
+
+    .empty-state{
+      padding: 18px 14px;
+      color: var(--muted2);
+      font-size: 12px;
+      text-align:center;
+    }
+
+    .results.compact{
+      max-height: 260px;
+    }
+
+    .sticky-actions{
+      position: sticky;
+      bottom: 0;
+      z-index: 2;
+      padding-top: 10px;
+      background: linear-gradient(180deg, rgba(9,18,31,0), rgba(9,18,31,.94) 35%);
+      margin-top: 10px;
     }
 
     .card h2{
@@ -250,7 +308,7 @@
       border-radius: 14px;
       border:1px solid rgba(255,255,255,.10);
       background: rgba(0,0,0,.12);
-      max-height: 420px;
+      max-height: 260px;
     }
     table{
       border-collapse: separate;
@@ -331,6 +389,7 @@
       <!-- ADD DATASET -->
       <div class="card">
         <h2>Add dataset</h2>
+        <div class="subtle-note">Scan a folder, inspect parquet files, then register a dataset for analysis.</div>
 
         <div class="field" style="min-width:100%;">
           <label for="scanPath">Folder to scan</label>
@@ -387,6 +446,14 @@
       <!-- QUERY -->
       <div class="card">
         <h2>Query</h2>
+        <div class="subtle-note">Choose a dataset and preset, inspect structure, then run analysis.</div>
+        <div class="section-toolbar">
+          <div class="mini-badges">
+            <span class="mini-badge">Inspect</span>
+            <span class="mini-badge">Analyze</span>
+            <span class="mini-badge">Export</span>
+          </div>
+        </div>
 
         <div class="row">
           <div class="field" style="min-width:240px;">
@@ -442,14 +509,16 @@
           <div id="dynamicParams" class="row"></div>
         </div>
 
-        <div class="row" style="margin-top:12px;">
-          <button class="btn primary" id="runBtn">Run</button>
-          <button class="btn" id="copyBtn">Copy (TSV)</button>
-          <button class="btn good" id="exportBtn">Download Excel</button>
-        </div>
-
         <div class="hint" id="queryHint">
           Tip: Add a dataset first, then inspect it, run a preset, and save useful queries below.
+        </div>
+
+        <div class="sticky-actions">
+          <div class="row" style="margin-top:12px;">
+            <button class="btn primary" id="runBtn">Run</button>
+            <button class="btn" id="copyBtn">Copy Preview</button>
+            <button class="btn good" id="exportBtn">Download Excel</button>
+          </div>
         </div>
 
         <div class="status">
@@ -471,11 +540,18 @@
       <!-- SAVED QUERIES -->
       <div class="card span-2">
         <h2>Saved Queries</h2>
-        <div class="row" style="margin-bottom:12px;">
+        <div class="subtle-note">Store frequently used analyses and reload them in one click.</div>
+        <div class="section-toolbar">
+          <div class="mini-badges">
+            <span class="mini-badge">Reusable</span>
+            <span class="mini-badge">Fast reload</span>
+          </div>
+          <div class="row" style="margin-bottom:0;">
           <button class="btn good" id="saveQueryBtn" type="button">Save Current Query</button>
           <button class="btn" id="refreshQueriesBtn" type="button">Refresh</button>
+          </div>
         </div>
-        <div class="results" style="display:block; max-height:220px;">
+        <div class="results compact" style="display:block;">
           <table id="savedQueriesTable">
             <thead>
               <tr>
@@ -530,6 +606,11 @@
       return Number(n).toLocaleString();
     }
 
+    function fmt(n) {
+      if (n === null || n === undefined || n === "") return "—";
+      return Number(n).toLocaleString();
+    }
+
     async function apiJson(url, opts) {
       const res = await fetch(url, opts);
       const contentType = res.headers.get("content-type") || "";
@@ -556,14 +637,8 @@
       }
 
       $("datasetInfoName").textContent = dataset.name || "Dataset";
-      $("datasetInfoRows").textContent =
-        (dataset.row_count !== null && dataset.row_count !== undefined)
-          ? num(dataset.row_count)
-          : "—";
-      $("datasetInfoCols").textContent =
-        (dataset.column_count !== null && dataset.column_count !== undefined)
-          ? num(dataset.column_count)
-          : "—";
+      $("datasetInfoRows").textContent = fmt(dataset.row_count);
+      $("datasetInfoCols").textContent = fmt(dataset.column_count);
       $("datasetInfoSize").textContent =
         (dataset.file_size_bytes !== null && dataset.file_size_bytes !== undefined)
           ? bytesToHuman(dataset.file_size_bytes)
@@ -764,7 +839,7 @@
         const tr = document.createElement("tr");
         const td = document.createElement("td");
         td.colSpan = 4;
-        td.textContent = "No saved queries yet.";
+        td.innerHTML = '<div class="empty-state">No saved queries yet. Run a query you like, then click <strong>Save Current Query</strong>.</div>';
         tr.appendChild(td);
         body.appendChild(tr);
         return;

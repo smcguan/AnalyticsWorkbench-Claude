@@ -26,6 +26,8 @@ logger = logging.getLogger("app")
 
 app = FastAPI(title="Analytics Workbench")
 
+APP_VERSION = "1.1.0"
+
 def app_base_dir() -> Path:
     """
     Packaged: folder containing the EXE
@@ -480,7 +482,7 @@ def favicon():
 def api_version():
     return {
         "name": os.getenv("APP_NAME", "Analytics Workbench"),
-        "version": os.getenv("APP_VERSION", "1.0.0"),
+        "version": os.getenv("APP_VERSION", APP_VERSION),
         "base_dir": str(BASE_DIR),
         "datasets_dir": str(DATASETS_DIR),
         "exports_dir": str(EXPORTS_DIR),
