@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import duckdb
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -26,10 +26,6 @@ logger = logging.getLogger("app")
 
 app = FastAPI(title="Analytics Workbench")
 
-
-# ============================================================
-# Runtime paths (single source of truth)
-# ============================================================
 def app_base_dir() -> Path:
     """
     Packaged: folder containing the EXE
@@ -51,6 +47,11 @@ EXPORTS_DIR = Path(os.getenv("AW_EXPORTS_DIR", str(BASE_DIR / "exports")))
 DATASETS_DIR.mkdir(parents=True, exist_ok=True)
 EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
+# Preview/export safety
+DEFAULT_PREVIEW_ROWS = int(os.getenv("AW_DEFAULT_PREVIEW_ROWS", "50"))
+MAX_PREVIEW_ROWS = int(os.getenv("AW_MAX_PREVIEW_ROWS", "200"))
+MAX_EXPORT_ROWS = int(os.getenv("AW_MAX_EXPORT_ROWS", "200000"))
+
 # Startup confirmation — logged once at import time
 logger.info(
     "app started | mode=%s | exports_dir=%s",
@@ -59,9 +60,68 @@ logger.info(
 )
 
 
+
+
+# ============================================================
+# Presets loading (6B)
+# ============================================================
+_REQUIRED_PRESET_FIELDS = {"id", "name", "sql"}
+
+
+def _validate_presets(raw: list[Any]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        if not _REQUIRED_PRESET_FIELDS.issubset(item.keys()):
+            continue
+        out.append(item)
+    return out
+
+
+def _load_presets() -> list[dict[str, Any]]:
+    """Load presets.json from app data/base dir; fallback to python PRESETS."""
+    # Prefer an explicit path if provided
+    explicit = os.getenv("AW_PRESETS_PATH")
+    candidates: list[Path] = []
+    if explicit:
+        candidates.append(Path(explicit))
+    # Common locations
+    candidates.extend([
+        BASE_DIR / "presets.json",
+        DATA_DIR / "presets.json",
+        DATASETS_DIR / "presets.json",
+    ])
+    for fp in candidates:
+        try:
+            if fp.exists() and fp.is_file():
+                raw = json.loads(fp.read_text(encoding="utf-8"))
+                if isinstance(raw, list):
+                    validated = _validate_presets(raw)
+                    if validated:
+                        logger.info("loaded presets.json | path=%s count=%d", fp, len(validated))
+                        return validated
+        except Exception as e:
+            logger.warning("failed to load presets.json | path=%s | reason=%s", fp, e)
+    return PRESETS
+
+
+ACTIVE_PRESETS = _load_presets()
+
+# Preview + safety caps
+MAX_PREVIEW_ROWS = int(os.getenv("AW_MAX_PREVIEW_ROWS", "200"))
+DEFAULT_PREVIEW_ROWS = int(os.getenv("AW_DEFAULT_PREVIEW_ROWS", "50"))
+
+
+# ============================================================
+# Runtime paths (single source of truth)
+# ============================================================
+
 # ============================================================
 # Models
 # ============================================================
+
+
 class ScanRequest(BaseModel):
     path: str
     recursive: bool = False
@@ -76,6 +136,7 @@ class RegisterRequest(BaseModel):
 # ============================================================
 # Helpers
 # ============================================================
+
 def _safe_name(name: str) -> str:
     name = (name or "").strip()
     name = re.sub(r"[^A-Za-z0-9._-]+", "_", name)
@@ -123,8 +184,19 @@ def dataset_source_path(dataset: str) -> tuple[str, bool]:
     return (glob_path, True)
 
 
+def _dataset_dir(dataset: str) -> Path:
+    return (DATASETS_DIR / dataset).resolve()
+
+
+def _dataset_mode(dataset: str) -> str:
+    ds_dir = _dataset_dir(dataset)
+    if (ds_dir / "_reference.txt").exists():
+        return "reference"
+    return "copy"
+
+
 def get_preset(preset_id: str) -> dict[str, Any] | None:
-    for p in PRESETS:
+    for p in ACTIVE_PRESETS:
         if p.get("id") == preset_id:
             return p
     return None
@@ -135,10 +207,13 @@ def _connect() -> duckdb.DuckDBPyConnection:
     return duckdb.connect()
 
 
+def _sql_escape_path(p: str) -> str:
+    # Defensive: single-quote escape for embedding into SQL string
+    return p.replace("'", "''")
+
+
 def _is_writable_dir(p: Path) -> tuple[bool, str | None]:
-    """
-    Returns (ok, error_message).
-    """
+    """Returns (ok, error_message)."""
     try:
         p.mkdir(parents=True, exist_ok=True)
         test = p / ".__aw_write_test__"
@@ -193,26 +268,58 @@ def _audit_log(event: dict[str, Any]) -> None:
         logger.warning("audit log write failed | reason=%s", e)
 
 
-def _sql_for(dataset: str, preset_id: str, threshold: int | None) -> tuple[str, str]:
+# ============================================================
+# Dynamic preset params (4B)
+# ============================================================
+
+def _extract_dynamic_params(request: Request, reserved: set[str], threshold_fallback: int | None) -> dict[str, Any]:
+    """
+    Pull query params from the request excluding reserved keys.
+    Values remain strings (DuckDB SQL templates are string formatted).
+    """
+    provided: dict[str, Any] = {}
+    for k, v in request.query_params.items():
+        if k in reserved:
+            continue
+        provided[k] = v
+    if threshold_fallback is not None and "threshold" not in provided:
+        provided["threshold"] = threshold_fallback
+    return provided
+
+
+def _build_final_params(preset_def: dict[str, Any], provided_params: dict[str, Any]) -> dict[str, Any]:
+    """Merge preset default params with provided params; validate required placeholders."""
+    final_params = dict(preset_def.get("params", {}) or {})
+    final_params.update({k: v for k, v in provided_params.items() if v is not None})
+
+    # Try formatting early to surface missing params nicely
+    try:
+        preset_def["sql"].format(**final_params)
+    except KeyError as e:
+        missing = str(e).strip("'")
+        raise HTTPException(status_code=400, detail=f"Missing required preset param: {missing}")
+    return final_params
+
+
+def _sql_for(dataset: str, preset_id: str, provided_params: dict[str, Any]) -> tuple[str, str]:
     preset_def = get_preset(preset_id)
     if not preset_def:
         raise HTTPException(status_code=400, detail=f"Unknown preset: {preset_id}")
 
     src, _is_glob = dataset_source_path(dataset)
 
-    final_params = dict(preset_def.get("params", {}))
-    if threshold is not None:
-        final_params["threshold"] = threshold
+    final_params = _build_final_params(preset_def, provided_params)
 
     sql = preset_def["sql"].format(**final_params)
 
     # Some DuckDB introspection functions expect a path, not a relation.
     # Preserve legacy presets that use parquet_schema(dataset) / parquet_metadata(dataset).
-    sql = sql.replace("parquet_schema(dataset)", f"parquet_schema('{src}')")
-    sql = sql.replace("parquet_metadata(dataset)", f"parquet_metadata('{src}')")
+    esc = _sql_escape_path(src)
+    sql = sql.replace("parquet_schema(dataset)", f"parquet_schema('{esc}')")
+    sql = sql.replace("parquet_metadata(dataset)", f"parquet_metadata('{esc}')")
 
     # Replace placeholder token `dataset` with a parquet reader for normal queries
-    sql = sql.replace("dataset", f"read_parquet('{src}')")
+    sql = sql.replace("dataset", f"read_parquet('{esc}')")
 
     return sql, src
 
@@ -220,6 +327,8 @@ def _sql_for(dataset: str, preset_id: str, threshold: int | None) -> tuple[str, 
 # ============================================================
 # UI mount
 # ============================================================
+
+
 @app.get("/")
 def root():
     return RedirectResponse(url="/ui/")
@@ -243,6 +352,8 @@ def favicon():
 # ============================================================
 # API
 # ============================================================
+
+
 @app.get("/api/version")
 def api_version():
     return {
@@ -270,9 +381,7 @@ def api_health():
     frontend_ok = (FRONTEND_DIR / "index.html").exists()
     frontend_err = None if frontend_ok else f"Missing {FRONTEND_DIR / 'index.html'}"
 
-    status = "ok"
-    if not (duck_ok and datasets_ok and exports_ok and frontend_ok):
-        status = "degraded"
+    status = "ok" if (duck_ok and datasets_ok and exports_ok and frontend_ok) else "degraded"
 
     return {
         "status": status,
@@ -292,6 +401,93 @@ def api_health():
 @app.get("/api/datasets")
 def api_datasets():
     return {"datasets": list_datasets()}
+
+
+@app.get("/api/datasets/{name}/meta")
+def api_dataset_meta(name: str):
+    """Return cached dataset metadata from _meta.json, with a live fallback."""
+    ds_dir = _dataset_dir(name)
+    if not ds_dir.exists() or not ds_dir.is_dir():
+        raise HTTPException(status_code=404, detail=f"Dataset not found: {name}")
+
+    mode = _dataset_mode(name)
+
+    # Source path (what read_parquet will use)
+    try:
+        src, is_glob = dataset_source_path(name)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+
+    meta_path = ds_dir / "_meta.json"
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            meta = {}
+        out = {
+            "dataset": name,
+            "mode": mode,
+            "source_path": src,
+            "is_glob": is_glob,
+            "row_count": meta.get("row_count"),
+            "column_count": meta.get("column_count"),
+            "file_size_bytes": meta.get("file_size_bytes"),
+            "last_scanned": meta.get("last_scanned"),
+            "meta_source": "cached",
+        }
+        _audit_log({"event": "meta", "status": "success", "dataset": name, "meta_source": "cached"})
+        return out
+
+    # Live fallback
+    t0 = time.perf_counter()
+    con = _connect()
+    try:
+        esc = _sql_escape_path(src)
+
+        # Column count via parquet_schema (one row per column)
+        try:
+            col_count = int(con.execute(f"SELECT COUNT(*) FROM parquet_schema('{esc}')").fetchone()[0])
+        except Exception:
+            col_count = None
+
+        # Row count via parquet_metadata (sum row groups)
+        try:
+            row_count = int(
+                con.execute(
+                    f"SELECT COALESCE(SUM(num_rows), 0) FROM parquet_metadata('{esc}')"
+                ).fetchone()[0]
+            )
+        except Exception:
+            row_count = None
+
+        # File size
+        file_size_bytes: int | None
+        try:
+            if mode == "reference":
+                file_size_bytes = Path(src).stat().st_size
+            else:
+                # copy/glob: sum all parquet files in dataset folder
+                file_size_bytes = sum(p.stat().st_size for p in ds_dir.glob("*.parquet"))
+        except Exception:
+            file_size_bytes = None
+
+        elapsed = round(time.perf_counter() - t0, 4)
+        out = {
+            "dataset": name,
+            "mode": mode,
+            "source_path": src,
+            "is_glob": is_glob,
+            "row_count": row_count,
+            "column_count": col_count,
+            "file_size_bytes": file_size_bytes,
+            "last_scanned": datetime.now().isoformat(timespec="seconds"),
+            "meta_source": "live",
+            "elapsed_seconds": elapsed,
+        }
+        _audit_log({"event": "meta", "status": "success", "dataset": name, "meta_source": "live", "elapsed_seconds": elapsed})
+        return out
+    finally:
+        con.close()
 
 
 @app.get("/api/presets")
@@ -329,6 +525,85 @@ def api_audit(limit: int = Query(200, ge=1, le=5000)):
     return {"events": events}
 
 
+@app.get("/api/schema")
+def api_schema(dataset: str = Query(...)):
+    """Return column names and DuckDB types for the dataset."""
+    try:
+        src, _is_glob = dataset_source_path(dataset)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+
+    con = _connect()
+    try:
+        esc = _sql_escape_path(src)
+        cur = con.execute(f"DESCRIBE SELECT * FROM read_parquet('{esc}')")
+        cols = cur.fetchall()
+        columns = [{"name": r[0], "type": r[1]} for r in cols]
+        _audit_log({"event": "schema", "status": "success", "dataset": dataset, "column_count": len(columns)})
+        return {"dataset": dataset, "columns": columns}
+    except Exception as e:
+        _audit_log({"event": "schema", "status": "error", "dataset": dataset, "error": str(e)})
+        raise
+    finally:
+        con.close()
+
+
+@app.get("/api/preview")
+def api_preview(dataset: str = Query(...), limit: int = Query(DEFAULT_PREVIEW_ROWS, ge=1)):
+    """Return first N rows of a dataset (no preset involved)."""
+    used_limit = min(limit, MAX_PREVIEW_ROWS)
+
+    try:
+        src, _is_glob = dataset_source_path(dataset)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+
+    con = _connect()
+    t0 = time.perf_counter()
+    try:
+        esc = _sql_escape_path(src)
+        sql = f"SELECT * FROM read_parquet('{esc}') LIMIT {int(used_limit)}"
+
+        cur = con.execute(sql)
+        cols = [d[0] for d in cur.description]
+        rows = cur.fetchall()
+        out_rows = [dict(zip(cols, r)) for r in rows]
+
+        elapsed = round(time.perf_counter() - t0, 4)
+        _audit_log(
+            {
+                "event": "preview",
+                "status": "success",
+                "dataset": dataset,
+                "limit": used_limit,
+                "rows_returned": len(out_rows),
+                "elapsed_seconds": elapsed,
+            }
+        )
+
+        return {
+            "dataset": dataset,
+            "limit": used_limit,
+            "rows_returned": len(out_rows),
+            "columns": cols,
+            "rows": out_rows,
+            "elapsed_seconds": elapsed,
+        }
+
+    except Exception as e:
+        msg = str(e)
+        # Friendlier error when copy-mode dataset folder is empty
+        if "No files found" in msg or "no files" in msg.lower():
+            raise HTTPException(status_code=404, detail=f"No parquet files found for dataset: {dataset}") from e
+        if "incompatible" in msg.lower() or "schema" in msg.lower():
+            raise HTTPException(status_code=400, detail="Inconsistent schemas across parquet files in dataset") from e
+
+        _audit_log({"event": "preview", "status": "error", "dataset": dataset, "error": msg})
+        raise
+    finally:
+        con.close()
+
+
 @app.get("/api/dialog/folder")
 def api_dialog_folder():
     """
@@ -350,23 +625,25 @@ def api_dialog_folder():
 
 @app.get("/api/run")
 def api_run(
+    request: Request,
     dataset: str = Query(...),
     preset: str = Query(...),
     threshold: int | None = None,
 ):
-    params = {"threshold": threshold} if threshold is not None else {}
+    params = _extract_dynamic_params(request, reserved={"dataset", "preset"}, threshold_fallback=threshold)
 
-    logger.info("query requested | dataset=%s preset=%s threshold=%s", dataset, preset, threshold)
+    logger.info("query requested | dataset=%s preset=%s params=%s", dataset, preset, params)
     t0 = time.perf_counter()
 
     try:
-        sql, _src = _sql_for(dataset, preset, threshold)
+        sql, _src = _sql_for(dataset, preset, params)
 
         con = _connect()
         try:
-            cur = con.execute(sql)
+            limited_sql = f"SELECT * FROM ({sql}) t LIMIT {MAX_PREVIEW_ROWS}"
+            cur = con.execute(limited_sql)
             cols = [d[0] for d in cur.description]
-            rows = cur.fetchmany(200)
+            rows = cur.fetchall()
 
             rowcount = int(con.execute(f"SELECT COUNT(*) FROM ({sql}) t").fetchone()[0])
             elapsed = time.perf_counter() - t0
@@ -374,7 +651,11 @@ def api_run(
             preview = [dict(zip(cols, r)) for r in rows]
             logger.info(
                 "query success | dataset=%s preset=%s rowcount=%d preview=%d elapsed=%s",
-                dataset, preset, rowcount, len(preview), round(elapsed, 4),
+                dataset,
+                preset,
+                rowcount,
+                len(preview),
+                round(elapsed, 4),
             )
 
             _audit_log(
@@ -429,17 +710,18 @@ def api_run(
 
 @app.get("/api/export")
 def api_export(
+    request: Request,
     dataset: str = Query(...),
     preset: str = Query(...),
     threshold: int | None = None,
 ):
-    params = {"threshold": threshold} if threshold is not None else {}
+    params = _extract_dynamic_params(request, reserved={"dataset", "preset"}, threshold_fallback=threshold)
 
-    logger.info("export requested | dataset=%s preset=%s threshold=%s", dataset, preset, threshold)
+    logger.info("export requested | dataset=%s preset=%s params=%s", dataset, preset, params)
     t0 = time.perf_counter()
 
     try:
-        sql, _src = _sql_for(dataset, preset, threshold)
+        sql, _src = _sql_for(dataset, preset, params)
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         safe_preset = preset.replace("/", "_").replace("\\", "_")
@@ -451,11 +733,19 @@ def api_export(
 
         con = _connect()
         try:
+            # Export row limit protection (5A)
+            try:
+                rowcount = int(con.execute(f"SELECT COUNT(*) FROM ({sql}) t").fetchone()[0])
+            except Exception:
+                rowcount = None
+            if rowcount is not None and rowcount > MAX_EXPORT_ROWS:
+                raise HTTPException(status_code=400, detail=f"Export too large: {rowcount} rows (limit {MAX_EXPORT_ROWS})")
+
             con.execute("CREATE OR REPLACE TEMP VIEW __export_view AS " + sql)
 
             try:
                 out_str = str(out_xlsx.resolve()).replace("\\", "/")
-                con.execute(f"COPY __export_view TO '{out_str}' (FORMAT XLSX, HEADER TRUE)")
+                con.execute(f"COPY __export_view TO '{_sql_escape_path(out_str)}' (FORMAT XLSX, HEADER TRUE)")
                 elapsed = round(time.perf_counter() - t0, 4)
                 logger.info("export success | file=%s path=%s elapsed=%s", out_xlsx.name, out_xlsx, elapsed)
 
@@ -479,9 +769,14 @@ def api_export(
             except Exception:
                 # Fallback: CSV always works
                 out_str = str(out_csv.resolve()).replace("\\", "/")
-                con.execute(f"COPY __export_view TO '{out_str}' (FORMAT CSV, HEADER TRUE)")
+                con.execute(f"COPY __export_view TO '{_sql_escape_path(out_str)}' (FORMAT CSV, HEADER TRUE)")
                 elapsed = round(time.perf_counter() - t0, 4)
-                logger.info("export success (csv fallback) | file=%s path=%s elapsed=%s", out_csv.name, out_csv, elapsed)
+                logger.info(
+                    "export success (csv fallback) | file=%s path=%s elapsed=%s",
+                    out_csv.name,
+                    out_csv,
+                    elapsed,
+                )
 
                 _audit_log(
                     {
@@ -567,7 +862,7 @@ def scan_for_parquet(req: ScanRequest):
                 # parquet_metadata provides num_rows per row-group
                 row_count = int(
                     con.execute(
-                        f"SELECT COALESCE(SUM(num_rows), 0) FROM parquet_metadata('{f_str}')"
+                        f"SELECT COALESCE(SUM(num_rows), 0) FROM parquet_metadata('{_sql_escape_path(f_str)}')"
                     ).fetchone()[0]
                 )
             except Exception:
@@ -604,7 +899,12 @@ def scan_for_parquet(req: ScanRequest):
 @app.post("/api/datasets/register")
 def register_dataset(req: RegisterRequest):
     t0 = time.perf_counter()
-    logger.info("register requested | dataset=%s parquet_path=%s mode=%s", req.dataset_name, req.parquet_path, req.mode)
+    logger.info(
+        "register requested | dataset=%s parquet_path=%s mode=%s",
+        req.dataset_name,
+        req.parquet_path,
+        req.mode,
+    )
 
     src = Path(req.parquet_path).expanduser()
     if not src.exists() or not src.is_file():
@@ -679,7 +979,7 @@ def api_shutdown(bg: BackgroundTasks):
 
     def _stop():
         time.sleep(0.25)  # let the HTTP response flush
-        os._exit(0)       # guaranteed process termination
+        os._exit(0)  # guaranteed process termination
 
     bg.add_task(_stop)
     return {"ok": True}
