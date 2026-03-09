@@ -1430,7 +1430,11 @@ def register_dataset(req: RegisterRequest):
 
         return {"error": "Parquet path must be an existing file."}
 
-    ds_name = _safe_name(req.dataset_name)
+    requested_name = (req.dataset_name or "").strip()
+    if not requested_name or requested_name.lower() == "newdataset":
+        requested_name = src.stem
+
+    ds_name = _safe_name(requested_name).replace("-", "_").replace(".", "_").lower()
     ds_dir = DATASETS_DIR / ds_name
     ds_dir.mkdir(parents=True, exist_ok=True)
 
