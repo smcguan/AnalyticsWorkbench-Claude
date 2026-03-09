@@ -393,7 +393,7 @@
             </div>
           </div>
 
-          <div class="subtle-note">Ask a question in plain English. This UI shell generates placeholder SQL only for now.</div>
+          <div class="subtle-note">Ask a question in plain English. The app sends your question and dataset to the backend and fills in generated SQL.</div>
 
           <div class="field" style="min-width:100%;">
             <label for="aiPrompt">Question</label>
@@ -967,12 +967,30 @@ LIMIT 100`;
     }
 
     async function generateAiSql() {
+      const dataset = $("datasetSelect").value;
       const prompt = $("aiPrompt").value.trim();
+
+      if (!dataset) { toast("Select a dataset first."); return; }
       if (!prompt) { toast("Enter a question first."); return; }
 
-      const sql = buildAiPlaceholderSql(prompt);
-      setCurrentSql(sql);
-      toast("Generated placeholder SQL. Backend wiring comes next.");
+      try {
+        $("aiGenerateBtn").disabled = true;
+        $("aiGenerateBtn").textContent = "Generating...";
+
+        const data = await apiJson("/api/ai/generate_sql", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ dataset, question: prompt })
+        });
+
+        setCurrentSql(data.sql || "");
+        toast("SQL generated from question.");
+      } catch (e) {
+        toast("Generate SQL failed: " + e.message);
+      } finally {
+        $("aiGenerateBtn").disabled = false;
+        $("aiGenerateBtn").textContent = "Generate SQL";
+      }
     }
 
     function setRunStatus(kind, msg) {

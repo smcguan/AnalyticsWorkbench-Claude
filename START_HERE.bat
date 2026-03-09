@@ -1,6 +1,10 @@
 @echo off
 setlocal EnableExtensions
 
+REM OpenAI configuration
+set AW_OPENAI_API_KEY=YOUR_OPENAI_KEY
+set AW_OPENAI_MODEL=gpt-4.1-mini
+
 REM Always run from the folder this BAT lives in
 set "ROOT=%~dp0"
 pushd "%ROOT%"

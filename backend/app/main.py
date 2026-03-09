@@ -9,6 +9,8 @@ import re
 import shutil
 import sys
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -153,6 +155,20 @@ class DeleteQueryRequest(BaseModel):
 class SqlRequest(BaseModel):
     dataset: str
     sql: str
+
+class AiSqlRequest(BaseModel):
+    dataset: str
+    question: str
+
+
+class AiSqlResponse(BaseModel):
+    status: str
+    dataset: str
+    question: str
+    sql: str = ""
+    message: str = ""
+    warnings: list[str] = []
+
 
 
 # ============================================================
@@ -613,6 +629,200 @@ def _load_dataset_context(dataset: str, refresh: bool = False) -> dict[str, Any]
         except Exception:
             logger.warning("dataset context load failed | dataset=%s", dataset)
     return _build_dataset_context(dataset)
+
+
+def _schema_context_for_prompt(dataset: str) -> dict[str, Any]:
+    context = _load_dataset_context(dataset, refresh=False)
+    columns = context.get("columns", [])
+    compact_columns = []
+    for col in columns:
+        compact_columns.append(
+            {
+                "name": col.get("name"),
+                "type": col.get("type"),
+                "kind": col.get("kind"),
+            }
+        )
+    return {
+        "dataset": dataset,
+        "row_count": context.get("row_count"),
+        "column_count": context.get("column_count"),
+        "columns": compact_columns,
+        "sample_rows": context.get("sample_rows", [])[:3],
+    }
+
+
+def _call_openai_sql_generator(dataset: str, question: str) -> dict[str, Any]:
+    api_key = (os.getenv("AW_OPENAI_API_KEY") or "").strip()
+    model = (os.getenv("AW_OPENAI_MODEL") or "").strip()
+    if not api_key:
+        return {
+            "status": "error",
+            "dataset": dataset,
+            "question": question,
+            "sql": "",
+            "message": "AW_OPENAI_API_KEY is not configured.",
+            "warnings": ["Set AW_OPENAI_API_KEY before using LLM-backed SQL generation."],
+        }
+    if not model:
+        return {
+            "status": "error",
+            "dataset": dataset,
+            "question": question,
+            "sql": "",
+            "message": "AW_OPENAI_MODEL is not configured.",
+            "warnings": ["Set AW_OPENAI_MODEL to the model you want to use for SQL generation."],
+        }
+
+    prompt_context = _schema_context_for_prompt(dataset)
+    system_prompt = """You generate DuckDB SQL for a local analytics workbench.
+
+Rules:
+- Return JSON only.
+- JSON keys: status, sql, message, warnings.
+- status must be either "ok" or "error".
+- Use only SELECT or WITH queries.
+- Use exactly this table name: dataset
+- Only use columns that exist in the provided schema.
+- Do not invent columns.
+- If the request cannot be answered from the schema, return status=error with sql="" and explain why.
+- Keep SQL concise and valid for DuckDB.
+"""
+
+    user_prompt = json.dumps(
+        {
+            "dataset_context": prompt_context,
+            "question": question,
+        },
+        ensure_ascii=False,
+        default=str,
+    )
+
+    payload = {
+        "model": model,
+        "input": [
+            {
+                "role": "system",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": system_prompt,
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": user_prompt,
+                    }
+                ],
+            },
+        ],
+    }
+
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/responses",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace")
+        return {
+            "status": "error",
+            "dataset": dataset,
+            "question": question,
+            "sql": "",
+            "message": "OpenAI API request failed.",
+            "warnings": [detail[:500]],
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "dataset": dataset,
+            "question": question,
+            "sql": "",
+            "message": f"OpenAI API request failed: {e}",
+            "warnings": [],
+        }
+
+    output_text = body.get("output_text", "")
+
+    if not output_text:
+        parts = []
+        for item in body.get("output", []):
+            if not isinstance(item, dict):
+                continue
+            for content in item.get("content", []):
+                if not isinstance(content, dict):
+                    continue
+                if content.get("type") in ("output_text", "text"):
+                    text = content.get("text", "")
+                    if text:
+                        parts.append(text)
+        output_text = "\n".join(parts).strip()
+
+    if not output_text:
+        return {
+            "status": "error",
+            "dataset": dataset,
+            "question": question,
+            "sql": "",
+            "message": "Model returned no text output.",
+            "warnings": [json.dumps(body)[:1000]],
+        }
+
+    try:
+        parsed = json.loads(output_text)
+    except Exception:
+        return {
+            "status": "error",
+            "dataset": dataset,
+            "question": question,
+            "sql": "",
+            "message": "Model returned non-JSON output.",
+            "warnings": [output_text[:500]],
+        }
+
+    return {
+        "status": str(parsed.get("status", "error")),
+        "dataset": dataset,
+        "question": question,
+        "sql": str(parsed.get("sql", "") or ""),
+        "message": str(parsed.get("message", "") or ""),
+        "warnings": parsed.get("warnings", []) if isinstance(parsed.get("warnings", []), list) else [],
+    }
+
+
+def _validate_generated_sql_for_dataset(dataset: str, sql: str) -> tuple[bool, list[str]]:
+    warnings: list[str] = []
+    try:
+        validated_sql = _validate_readonly_sql(sql)
+    except HTTPException as e:
+        return False, [str(e.detail)]
+
+    try:
+        src, _is_glob = dataset_source_path(dataset)
+        esc = _sql_escape_path(src)
+        test_sql = validated_sql.replace("dataset", f"read_parquet('{esc}')")
+        con = _connect()
+        try:
+            con.execute("EXPLAIN " + test_sql).fetchall()
+        finally:
+            con.close()
+    except Exception as e:
+        return False, [f"Generated SQL failed validation: {e}"]
+
+    return True, warnings
 
 
 # ============================================================
@@ -1430,11 +1640,7 @@ def register_dataset(req: RegisterRequest):
 
         return {"error": "Parquet path must be an existing file."}
 
-    requested_name = (req.dataset_name or "").strip()
-    if not requested_name or requested_name.lower() == "newdataset":
-        requested_name = src.stem
-
-    ds_name = _safe_name(requested_name).replace("-", "_").replace(".", "_").lower()
+    ds_name = _safe_name(req.dataset_name)
     ds_dir = DATASETS_DIR / ds_name
     ds_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1488,70 +1694,37 @@ def register_dataset(req: RegisterRequest):
 
 
 
-class AiSqlRequest(BaseModel):
-    dataset: str
-    question: str
-
-
 @app.post("/api/ai/generate_sql")
 def api_ai_generate_sql(req: AiSqlRequest):
-    """Generate SQL from a natural language question (Assignment 13B).
-    For now this is deterministic and uses dataset context only.
-    """
     if req.dataset not in list_datasets():
         raise HTTPException(status_code=404, detail=f"Dataset not found: {req.dataset}")
 
-    question = (req.question or "").strip().lower()
+    question = (req.question or "").strip()
     if not question:
         raise HTTPException(status_code=400, detail="Question is required.")
 
-    # Load dataset context (schema + stats)
-    context = _load_dataset_context(req.dataset, refresh=False)
-    cols = [c["name"] for c in context.get("columns", [])]
+    result = _call_openai_sql_generator(req.dataset, question)
 
-    # Simple rule‑based SQL generation (placeholder for LLM)
-    sql = None
+    if result.get("status") == "ok":
+        sql = str(result.get("sql", "") or "")
+        ok, validation_warnings = _validate_generated_sql_for_dataset(req.dataset, sql)
+        if not ok:
+            result["status"] = "error"
+            result["message"] = "Generated SQL did not pass validation."
+            result["warnings"] = list(result.get("warnings", [])) + validation_warnings
+            result["sql"] = ""
 
-    if "count" in question or "how many" in question:
-        sql = "SELECT COUNT(*) AS row_count FROM dataset"
+    _audit_log(
+        {
+            "event": "ai_generate_sql",
+            "status": result.get("status", "error"),
+            "dataset": req.dataset,
+            "question": req.question,
+            "warning_count": len(result.get("warnings", [])),
+        }
+    )
 
-    elif "group" in question or "per" in question:
-        for c in cols:
-            if c.lower() in question:
-                sql = f"""
-SELECT {c}, COUNT(*) AS count_rows
-FROM dataset
-GROUP BY {c}
-ORDER BY count_rows DESC
-""".strip()
-                break
-
-    elif "top" in question or "highest" in question:
-        for c in cols:
-            if c.lower() in question:
-                sql = f"""
-SELECT *
-FROM dataset
-ORDER BY {c} DESC
-LIMIT 20
-""".strip()
-                break
-
-    if not sql:
-        sql = "SELECT * FROM dataset LIMIT 100"
-
-    _audit_log({
-        "event": "ai_generate_sql",
-        "status": "success",
-        "dataset": req.dataset,
-        "question": req.question,
-    })
-
-    return {
-        "dataset": req.dataset,
-        "question": req.question,
-        "sql": sql
-    }
+    return result
 
 
 @app.post("/api/shutdown")
