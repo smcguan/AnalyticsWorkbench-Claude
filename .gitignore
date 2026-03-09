@@ -46,3 +46,7 @@ data/datasets/**
 
 # Inside demo, only allow small parquet files
 !data/datasets/demo/*.parquet
+
+# Environmental Variables
+
+.env
