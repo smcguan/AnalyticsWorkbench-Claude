@@ -222,6 +222,86 @@
       padding:5px 8px;
     }
 
+    .profile-grid{
+      display:grid;
+      grid-template-columns: repeat(4, minmax(110px, 1fr));
+      gap:10px;
+      margin-top:10px;
+    }
+
+    .profile-stat{
+      border:1px solid rgba(255,255,255,.10);
+      background: rgba(255,255,255,.04);
+      border-radius: 12px;
+      padding: 10px 12px;
+    }
+
+    .profile-stat .label{
+      font-size:11px;
+      color: var(--muted2);
+      text-transform: uppercase;
+      letter-spacing: .4px;
+      margin-bottom: 5px;
+    }
+
+    .profile-stat .value{
+      font-size: 15px;
+      color: var(--text);
+      font-weight: 700;
+    }
+
+    .mini-section-title{
+      font-size: 11px;
+      color: var(--muted2);
+      text-transform: uppercase;
+      letter-spacing: .4px;
+      margin: 14px 0 8px 0;
+    }
+
+    .chip{
+      display:inline-block;
+      padding: 3px 8px;
+      border-radius: 999px;
+      border:1px solid rgba(255,255,255,.10);
+      background: rgba(255,255,255,.04);
+      color: var(--muted);
+      font-size: 11px;
+      margin-right: 6px;
+    }
+
+    .btn.active-toggle{
+      border-color: rgba(88,166,255,.55);
+      background: rgba(88,166,255,.16);
+      color: #fff;
+      box-shadow: inset 0 0 0 1px rgba(88,166,255,.10);
+    }
+
+    .inspector-toolbar{
+      display:flex;
+      align-items:center;
+      gap:10px;
+      flex-wrap:wrap;
+      margin-top:10px;
+    }
+
+    .inspector-label{
+      font-size:11px;
+      text-transform:uppercase;
+      letter-spacing:.4px;
+      color: var(--muted2);
+      min-width:58px;
+    }
+
+    .inspector-buttons{
+      display:flex;
+      gap:8px;
+      flex-wrap:wrap;
+      padding:6px;
+      border:1px solid rgba(255,255,255,.08);
+      background: rgba(255,255,255,.03);
+      border-radius:14px;
+    }
+
     .empty-state{
       padding: 18px 14px;
       color: var(--muted2);
@@ -483,10 +563,37 @@
                 Source: <span id="datasetInfoSource">—</span>
               </div>
               <div class="row" style="margin-top:10px;">
-                <button class="btn" id="viewSchemaBtn" type="button">View Schema</button>
-                <button class="btn" id="hideSchemaBtn" type="button" style="display:none;">Hide Schema</button>
-                <button class="btn" id="previewDataBtn" type="button">Preview Data</button>
-                <button class="btn" id="hidePreviewBtn" type="button" style="display:none;">Hide Preview</button>
+                <div class="inspector-toolbar">
+                <div class="inspector-label">Inspector</div>
+                <div class="inspector-buttons">
+                  <button class="btn" id="viewProfileBtn" type="button">Profile</button>
+                  <button class="btn" id="viewSchemaBtn" type="button">Schema</button>
+                  <button class="btn" id="previewDataBtn" type="button">Preview</button>
+                </div>
+              </div>
+</div>
+            </div>
+
+            <div id="profileWrap" class="results" style="display:none; margin-top:10px;">
+              <div style="padding:7px 12px; font-size:11.5px; color:rgba(232,238,252,.50); border-bottom:1px solid rgba(255,255,255,.07); background:rgba(0,0,0,.10);">
+                Dataset profile
+              </div>
+              <div style="padding:12px;">
+                <div id="profileSummary" class="profile-grid"></div>
+                <div class="mini-section-title">Column overview</div>
+                <div class="results compact" style="display:block; max-height:180px;">
+                  <table id="profileColumnsTable">
+                    <thead>
+                      <tr>
+                        <th>Column</th>
+                        <th>Type</th>
+                        <th>Kind</th>
+                        <th>Stats / Top Values</th>
+                      </tr>
+                    </thead>
+                    <tbody id="profileColumnsBody"></tbody>
+                  </table>
+                </div>
               </div>
             </div>
 
@@ -592,9 +699,6 @@ LIMIT 100</textarea>
     </div>
   </div>
 
-  <div class="toast" id="toast"></div>    </div>
-  </div>
-
   <div class="toast" id="toast"></div>
 
   <script>
@@ -652,6 +756,7 @@ LIMIT 100</textarea>
     let lastRun = { columns: [], rows: [], rowcount: 0, elapsed: 0 };
     let presets = []; // <-- 4B: store preset definitions including param schema
     let datasetMap = new Map();
+    let inspectorBusy = false;
 
     function renderDatasetInfo(dataset) {
       const panel = $("datasetInfo");
@@ -705,6 +810,221 @@ LIMIT 100</textarea>
       }
     }
 
+    function panelButtons() {
+      return {
+        profile: $("viewProfileBtn"),
+        schema: $("viewSchemaBtn"),
+        preview: $("previewDataBtn"),
+      };
+    }
+
+    function clearToggleButtons() {
+      Object.values(panelButtons()).forEach((btn) => {
+        if (btn) btn.classList.remove("active-toggle");
+      });
+    }
+
+    function hideProfile() {
+      const el = $("profileWrap");
+      if (el) el.style.display = "none";
+    }
+
+    function hideSchema() {
+      const el = $("schemaWrap");
+      if (el) el.style.display = "none";
+    }
+
+    function hideDatasetPreview() {
+      const el = $("datasetPreviewWrap");
+      if (el) el.style.display = "none";
+    }
+
+    function hideInspectorPanels() {
+      hideProfile();
+      hideSchema();
+      hideDatasetPreview();
+      clearToggleButtons();
+    }
+
+    function isPanelOpen(panelName) {
+      const map = {
+        profile: $("profileWrap"),
+        schema: $("schemaWrap"),
+        preview: $("datasetPreviewWrap"),
+      };
+      const el = map[panelName];
+      return !!(el && el.style.display === "block");
+    }
+
+    function openInspector(panelName) {
+      hideInspectorPanels();
+
+      const map = {
+        profile: $("profileWrap"),
+        schema: $("schemaWrap"),
+        preview: $("datasetPreviewWrap"),
+      };
+
+      const btn = panelButtons()[panelName];
+      const el = map[panelName];
+
+      if (btn) btn.classList.add("active-toggle");
+      if (el) el.style.display = "block";
+    }
+
+    function renderProfile(data) {
+      const wrap = $("profileWrap");
+      const summary = $("profileSummary");
+      const body = $("profileColumnsBody");
+
+      summary.innerHTML = "";
+      body.innerHTML = "";
+
+      const stats = [
+        ["Rows", fmt(data.row_count)],
+        ["Columns", fmt(data.column_count)],
+        ["Size", (data.file_size_bytes !== null && data.file_size_bytes !== undefined) ? bytesToHuman(data.file_size_bytes) : "—"],
+        ["Source", data.meta_source || "—"],
+      ];
+
+      for (const [label, value] of stats) {
+        const card = document.createElement("div");
+        card.className = "profile-stat";
+        card.innerHTML = `<div class="label">${label}</div><div class="value">${value}</div>`;
+        summary.appendChild(card);
+      }
+
+      const cols = data.columns || [];
+      if (!cols.length) {
+        const tr = document.createElement("tr");
+        const td = document.createElement("td");
+        td.colSpan = 4;
+        td.innerHTML = '<div class="empty-state">No profiling information available.</div>';
+        tr.appendChild(td);
+        body.appendChild(tr);
+      } else {
+        for (const col of cols) {
+          const tr = document.createElement("tr");
+
+          const nameTd = document.createElement("td");
+          nameTd.textContent = col.name || "";
+          tr.appendChild(nameTd);
+
+          const typeTd = document.createElement("td");
+          typeTd.textContent = col.type || "";
+          typeTd.className = "mono";
+          tr.appendChild(typeTd);
+
+          const kindTd = document.createElement("td");
+          kindTd.innerHTML = `<span class="chip">${col.kind || ""}</span>`;
+          tr.appendChild(kindTd);
+
+          const statsTd = document.createElement("td");
+          if (col.stats) {
+            const parts = [];
+            if (col.stats.min !== undefined && col.stats.min !== null) parts.push(`min: ${col.stats.min}`);
+            if (col.stats.max !== undefined && col.stats.max !== null) parts.push(`max: ${col.stats.max}`);
+            if (col.stats.avg !== undefined && col.stats.avg !== null) parts.push(`avg: ${Number(col.stats.avg).toFixed(2)}`);
+            if (col.stats.null_count !== undefined) parts.push(`nulls: ${fmt(col.stats.null_count)}`);
+            statsTd.textContent = parts.join(" • ");
+          } else if (col.top_values && col.top_values.length) {
+            statsTd.textContent = col.top_values.map(x => `${x.value} (${fmt(x.count)})`).join(", ");
+          } else if (col.null_count !== undefined) {
+            statsTd.textContent = `nulls: ${fmt(col.null_count)}`;
+          } else {
+            statsTd.textContent = "";
+          }
+          tr.appendChild(statsTd);
+          body.appendChild(tr);
+        }
+      }
+
+      if (wrap) wrap.style.display = "block";
+    }
+
+    async function viewProfile(refresh=false) {
+      const dataset = $("datasetSelect").value;
+      if (!dataset) {
+        toast("Select a dataset first.");
+        return;
+      }
+
+      if (inspectorBusy) return;
+
+      if (isPanelOpen("profile")) {
+        hideInspectorPanels();
+        return;
+      }
+
+      inspectorBusy = true;
+      try {
+        const qs = new URLSearchParams({ dataset });
+        if (refresh) qs.set("refresh", "true");
+        const data = await apiJson("/api/profile?" + qs.toString());
+        openInspector("profile");
+        renderProfile(data);
+      } catch (e) {
+        hideInspectorPanels();
+        toast("Profile load failed: " + e.message);
+      } finally {
+        inspectorBusy = false;
+      }
+    }
+
+    async function viewSchema() {
+      const dataset = $("datasetSelect").value;
+      if (!dataset) {
+        toast("Select a dataset first.");
+        return;
+      }
+
+      if (inspectorBusy) return;
+
+      if (isPanelOpen("schema")) {
+        hideInspectorPanels();
+        return;
+      }
+
+      inspectorBusy = true;
+      try {
+        const data = await apiJson("/api/schema?dataset=" + encodeURIComponent(dataset));
+        openInspector("schema");
+        renderSchema(data.columns || []);
+      } catch (e) {
+        hideInspectorPanels();
+        toast("Schema load failed: " + e.message);
+      } finally {
+        inspectorBusy = false;
+      }
+    }
+
+    async function previewDataset() {
+      const dataset = $("datasetSelect").value;
+      if (!dataset) {
+        toast("Select a dataset first.");
+        return;
+      }
+
+      if (inspectorBusy) return;
+
+      if (isPanelOpen("preview")) {
+        hideInspectorPanels();
+        return;
+      }
+
+      inspectorBusy = true;
+      try {
+        const data = await apiJson("/api/preview?dataset=" + encodeURIComponent(dataset));
+        openInspector("preview");
+        renderDatasetPreview(data.columns || [], data.rows || []);
+      } catch (e) {
+        hideInspectorPanels();
+        toast("Preview load failed: " + e.message);
+      } finally {
+        inspectorBusy = false;
+      }
+    }
+
     function renderSchema(columns) {
       const body = $("schemaBody");
       body.innerHTML = "";
@@ -733,39 +1053,21 @@ LIMIT 100</textarea>
         }
       }
 
-      $("schemaWrap").style.display = "block";
-      $("hideSchemaBtn").style.display = "inline-block";
+      const wrap = $("schemaWrap");
+      if (wrap) wrap.style.display = "block";
     }
 
-    async function viewSchema() {
-      const dataset = $("datasetSelect").value;
-      if (!dataset) {
-        toast("Select a dataset first.");
-        return;
-      }
-
-      try {
-        const data = await apiJson("/api/schema?dataset=" + encodeURIComponent(dataset));
-        renderSchema(data.columns || []);
-      } catch (e) {
-        toast("Schema load failed: " + e.message);
-      }
-    }
-
-    function hideSchema() {
-      $("schemaWrap").style.display = "none";
-      $("hideSchemaBtn").style.display = "none";
-    }
 
     function renderDatasetPreview(columns, rows) {
+      const wrap = $("datasetPreviewWrap");
       const head = $("datasetPreviewHead");
       const body = $("datasetPreviewBody");
+
       head.innerHTML = "";
       body.innerHTML = "";
 
       if (!columns || !columns.length) {
-        $("datasetPreviewWrap").style.display = "none";
-        $("hidePreviewBtn").style.display = "none";
+        if (wrap) wrap.style.display = "none";
         return;
       }
 
@@ -788,31 +1090,9 @@ LIMIT 100</textarea>
         body.appendChild(tr);
       }
 
-      $("datasetPreviewWrap").style.display = "block";
-      $("hidePreviewBtn").style.display = "inline-block";
+      if (wrap) wrap.style.display = "block";
     }
 
-    async function previewDataset() {
-      const dataset = $("datasetSelect").value;
-      if (!dataset) {
-        toast("Select a dataset first.");
-        return;
-      }
-
-      try {
-        const data = await apiJson("/api/preview?dataset=" + encodeURIComponent(dataset));
-        renderDatasetPreview(data.columns || [], data.rows || []);
-      } catch (e) {
-        toast("Preview failed: " + e.message);
-      }
-    }
-
-    function hideDatasetPreview() {
-      $("datasetPreviewWrap").style.display = "none";
-      $("hidePreviewBtn").style.display = "none";
-      $("datasetPreviewHead").innerHTML = "";
-      $("datasetPreviewBody").innerHTML = "";
-    }
 
     function currentQueryPayload() {
       const dataset = $("datasetSelect").value;
@@ -1480,14 +1760,13 @@ LIMIT 100</textarea>
     $("quitBtn").addEventListener("click", quitApp);
     $("saveQueryBtn").addEventListener("click", saveCurrentQuery);
     $("refreshQueriesBtn").addEventListener("click", loadSavedQueries);
+    $("viewProfileBtn").addEventListener("click", () => viewProfile(false));
     $("viewSchemaBtn").addEventListener("click", viewSchema);
-    $("hideSchemaBtn").addEventListener("click", hideSchema);
     $("previewDataBtn").addEventListener("click", previewDataset);
-    $("hidePreviewBtn").addEventListener("click", hideDatasetPreview);
 
     // 4B: rerender params whenever preset changes
     $("presetSelect").addEventListener("change", renderPresetParams);
-    $("datasetSelect").addEventListener("change", () => { hideSchema(); hideDatasetPreview(); loadDatasetMeta($("datasetSelect").value); });
+    $("datasetSelect").addEventListener("change", () => { hideInspectorPanels(); loadDatasetMeta($("datasetSelect").value); });
 
     // -----------------------------
     // Init

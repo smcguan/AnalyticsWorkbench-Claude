@@ -46,6 +46,7 @@ DATA_DIR = Path(os.getenv("AW_DATA_DIR", str(BASE_DIR / "data")))
 DATASETS_DIR = Path(os.getenv("AW_DATASETS_DIR", str(DATA_DIR / "datasets")))
 EXPORTS_DIR = Path(os.getenv("AW_EXPORTS_DIR", str(BASE_DIR / "exports")))
 QUERIES_PATH = Path(os.getenv("AW_QUERIES_PATH", str(DATA_DIR / "queries.json")))
+DATASET_CONTEXT_FILENAME = "dataset_context.json"
 
 DATASETS_DIR.mkdir(parents=True, exist_ok=True)
 EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -288,16 +289,11 @@ def _dataset_meta_summary(dataset: str) -> dict[str, Any]:
     con = _connect()
     try:
         row_count = int(
-            con.execute(
-                f"SELECT COALESCE(SUM(num_rows), 0) FROM parquet_metadata('{esc}')"
-            ).fetchone()[0]
+            con.execute(f"SELECT COUNT(*) FROM read_parquet('{esc}')").fetchone()[0]
         )
-
         # parquet_schema() returns one row per column
-        column_count = int(
-            con.execute(
-                f"SELECT COUNT(*) FROM parquet_schema('{esc}')"
-            ).fetchone()[0]
+        col_count = int(
+            con.execute(f"SELECT COUNT(*) FROM parquet_schema('{esc}')").fetchone()[0]
         )
     finally:
         con.close()
@@ -314,7 +310,7 @@ def _dataset_meta_summary(dataset: str) -> dict[str, Any]:
     return {
         "name": dataset,
         "row_count": row_count,
-        "column_count": column_count,
+        "column_count": col_count,
         "file_size_bytes": file_size_bytes,
         "meta_source": "live",
     }
@@ -482,6 +478,143 @@ def _validate_readonly_sql(sql: str) -> str:
     return s
 
 
+
+
+def _dataset_context_path(dataset: str) -> Path:
+    return (DATASETS_DIR / dataset / DATASET_CONTEXT_FILENAME).resolve()
+
+
+def _classify_column_kind(col_type: str) -> str:
+    t = (col_type or "").upper()
+    if any(x in t for x in ["TIMESTAMP", "DATE", "TIME"]):
+        return "datetime"
+    if any(x in t for x in ["INT", "DECIMAL", "DOUBLE", "FLOAT", "REAL", "BIGINT", "SMALLINT", "HUGEINT"]):
+        return "numeric"
+    if "BOOL" in t:
+        return "boolean"
+    return "categorical"
+
+
+def _preview_value(v: Any) -> Any:
+    if isinstance(v, float):
+        return round(v, 4)
+    return v
+
+
+def _build_dataset_context(dataset: str) -> dict[str, Any]:
+    src, _is_glob = dataset_source_path(dataset)
+    esc = _sql_escape_path(src)
+    ds_summary = _dataset_meta_summary(dataset)
+
+    con = _connect()
+    try:
+        schema_cur = con.execute(f"DESCRIBE SELECT * FROM read_parquet('{esc}')")
+        schema_rows = schema_cur.fetchall()
+
+        columns: list[dict[str, Any]] = []
+        for row in schema_rows:
+            col_name = row[0]
+            col_type = row[1]
+            kind = _classify_column_kind(col_type)
+            entry: dict[str, Any] = {
+                "name": col_name,
+                "type": col_type,
+                "kind": kind,
+            }
+
+            quoted = '"' + str(col_name).replace('"', '""') + '"'
+            if kind == "numeric":
+                try:
+                    stats = con.execute(
+                        f"""
+                        SELECT
+                            MIN({quoted}) AS min_value,
+                            MAX({quoted}) AS max_value,
+                            AVG({quoted}) AS avg_value,
+                            SUM(CASE WHEN {quoted} IS NULL THEN 1 ELSE 0 END) AS null_count
+                        FROM read_parquet('{esc}')
+                        """
+                    ).fetchone()
+                    entry["stats"] = {
+                        "min": _preview_value(stats[0]),
+                        "max": _preview_value(stats[1]),
+                        "avg": _preview_value(stats[2]),
+                        "null_count": int(stats[3] or 0),
+                    }
+                except Exception:
+                    entry["stats"] = {}
+            elif kind in {"categorical", "boolean"}:
+                try:
+                    top_vals = con.execute(
+                        f"""
+                        SELECT {quoted} AS value, COUNT(*) AS cnt
+                        FROM read_parquet('{esc}')
+                        GROUP BY {quoted}
+                        ORDER BY cnt DESC
+                        LIMIT 5
+                        """
+                    ).fetchall()
+                    null_count = con.execute(
+                        f"SELECT SUM(CASE WHEN {quoted} IS NULL THEN 1 ELSE 0 END) FROM read_parquet('{esc}')"
+                    ).fetchone()[0]
+                    entry["top_values"] = [{"value": _preview_value(v), "count": int(c)} for v, c in top_vals]
+                    entry["null_count"] = int(null_count or 0)
+                except Exception:
+                    entry["top_values"] = []
+            elif kind == "datetime":
+                try:
+                    stats = con.execute(
+                        f"""
+                        SELECT
+                            MIN({quoted}) AS min_value,
+                            MAX({quoted}) AS max_value,
+                            SUM(CASE WHEN {quoted} IS NULL THEN 1 ELSE 0 END) AS null_count
+                        FROM read_parquet('{esc}')
+                        """
+                    ).fetchone()
+                    entry["stats"] = {
+                        "min": _preview_value(stats[0]),
+                        "max": _preview_value(stats[1]),
+                        "null_count": int(stats[2] or 0),
+                    }
+                except Exception:
+                    entry["stats"] = {}
+
+            columns.append(entry)
+
+        sample_cur = con.execute(f"SELECT * FROM read_parquet('{esc}') LIMIT 5")
+        sample_cols = [d[0] for d in sample_cur.description]
+        sample_rows_raw = sample_cur.fetchall()
+        sample_rows = [{k: _preview_value(v) for k, v in zip(sample_cols, row)} for row in sample_rows_raw]
+    finally:
+        con.close()
+
+    context = {
+        "dataset": dataset,
+        "row_count": ds_summary.get("row_count"),
+        "column_count": ds_summary.get("column_count"),
+        "file_size_bytes": ds_summary.get("file_size_bytes"),
+        "meta_source": ds_summary.get("meta_source"),
+        "columns": columns,
+        "sample_rows": sample_rows,
+    }
+
+    ctx_path = _dataset_context_path(dataset)
+    ctx_path.parent.mkdir(parents=True, exist_ok=True)
+    ctx_path.write_text(json.dumps(context, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+    return context
+
+
+def _load_dataset_context(dataset: str, refresh: bool = False) -> dict[str, Any]:
+    ctx_path = _dataset_context_path(dataset)
+    if not refresh and ctx_path.exists():
+        try:
+            return json.loads(ctx_path.read_text(encoding="utf-8"))
+        except Exception:
+            logger.warning("dataset context load failed | dataset=%s", dataset)
+    return _build_dataset_context(dataset)
+
+
 # ============================================================
 # UI mount
 # ============================================================
@@ -636,13 +769,9 @@ def api_dataset_meta(name: str):
         except Exception:
             col_count = None
 
-        # Row count via parquet_metadata (sum row groups)
+        # Row count via direct parquet scan for DuckDB compatibility
         try:
-            row_count = int(
-                con.execute(
-                    f"SELECT COALESCE(SUM(num_rows), 0) FROM parquet_metadata('{esc}')"
-                ).fetchone()[0]
-            )
+            row_count = int(con.execute(f"SELECT COUNT(*) FROM read_parquet('{esc}')").fetchone()[0])
         except Exception:
             row_count = None
 
@@ -776,6 +905,37 @@ def api_queries_delete(req: DeleteQueryRequest):
     )
 
     return {"ok": True, "deleted": name}
+
+
+@app.get("/api/profile")
+def api_profile(dataset: str = Query(...), refresh: bool = False):
+    if dataset not in list_datasets():
+        raise HTTPException(status_code=404, detail=f"Dataset not found: {dataset}")
+
+    try:
+        context = _load_dataset_context(dataset, refresh=refresh)
+        _audit_log(
+            {
+                "event": "profile",
+                "status": "success",
+                "dataset": dataset,
+                "refresh": refresh,
+            }
+        )
+        return context
+    except HTTPException:
+        raise
+    except Exception as e:
+        _audit_log(
+            {
+                "event": "profile",
+                "status": "error",
+                "dataset": dataset,
+                "refresh": refresh,
+                "error": str(e),
+            }
+        )
+        raise
 
 
 @app.post("/api/sql")
@@ -1206,10 +1366,10 @@ def scan_for_parquet(req: ScanRequest):
             f_str = str(f.resolve()).replace("\\", "/")
             row_count: int | None = None
             try:
-                # parquet_metadata provides num_rows per row-group
+                # Direct count is slower than pure metadata but compatible across DuckDB versions
                 row_count = int(
                     con.execute(
-                        f"SELECT COALESCE(SUM(num_rows), 0) FROM parquet_metadata('{_sql_escape_path(f_str)}')"
+                        f"SELECT COUNT(*) FROM read_parquet('{_sql_escape_path(f_str)}')"
                     ).fetchone()[0]
                 )
             except Exception:
@@ -1313,7 +1473,14 @@ def register_dataset(req: RegisterRequest):
         }
     )
 
-    return {"dataset": ds_name, "storage": storage}
+    try:
+        _build_dataset_context(ds_name)
+        context_built = True
+    except Exception as e:
+        logger.warning("dataset context build failed | dataset=%s | reason=%s", ds_name, e)
+        context_built = False
+
+    return {"dataset": ds_name, "storage": storage, "context_built": context_built}
 
 
 @app.post("/api/shutdown")
