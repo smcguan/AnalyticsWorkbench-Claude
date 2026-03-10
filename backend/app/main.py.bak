@@ -1,19 +1,4 @@
-﻿from __future__ import annotations
-
-from dotenv import load_dotenv
-from pathlib import Path
-import sys
-
-env_candidates = [
-    Path.cwd() / ".env",                              # current working directory
-    Path(sys.executable).parent / ".env",              # beside packaged EXE
-    Path("C:/dev/AnalyticsWorkbench-Claude/.env"),     # project root
-]
-
-for env_path in env_candidates:
-    if env_path.exists():
-        load_dotenv(env_path)
-        break
+from __future__ import annotations
 
 import getpass
 import json
@@ -22,6 +7,7 @@ import os
 import platform
 import re
 import shutil
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -33,10 +19,6 @@ from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.responses import FileResponse, Response
-try:
-    from dotenv import load_dotenv
-except Exception:  # pragma: no cover
-    load_dotenv = None
 
 from app.presets.doge import PRESETS  # noqa: E402
 
@@ -49,7 +31,7 @@ APP_VERSION = "1.1.0"
 def app_base_dir() -> Path:
     """
     Packaged: folder containing the EXE
-    Dev: repo root (â€¦/Analytics Workbench)
+    Dev: repo root (…/Analytics Workbench)
     """
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
@@ -58,89 +40,6 @@ def app_base_dir() -> Path:
 
 
 BASE_DIR = app_base_dir()
-def _load_local_env() -> None:
-    "Load a local .env without hardcoding secrets."
-    if load_dotenv is None:
-        logger.info("python-dotenv not installed; skipping .env load")
-        return
-
-    candidates: list[Path] = []
-    if getattr(sys, "frozen", False):
-        candidates.append(BASE_DIR / ".env")
-    else:
-        current = Path(__file__).resolve()
-        candidates.extend(
-            [
-                current.parents[2] / ".env",
-                current.parents[1] / ".env",
-                current.parent / ".env",
-            ]
-        )
-
-    seen: set[str] = set()
-    for env_path in candidates:
-        env_str = str(env_path.resolve())
-        if env_str in seen:
-            continue
-        seen.add(env_str)
-
-        try:
-            if env_path.exists():
-                load_dotenv(env_path, override=True)
-                logger.info("loaded .env | path=%s", env_path)
-                return
-        except Exception as e:
-            logger.warning("failed loading .env | path=%s | reason=%s", env_path, e)
-
-def _load_local_env() -> None:
-    """Load a local .env without hardcoding secrets."""
-    if load_dotenv is None:
-        logger.info("python-dotenv not installed; skipping .env load")
-        return
-
-    candidates: list[Path] = []
-    if getattr(sys, "frozen", False):
-        candidates.append(Path(sys.executable).resolve().parent / ".env")
-        candidates.append(Path.cwd() / ".env")
-    else:
-        current = Path(__file__).resolve()
-        candidates.extend(
-            [
-                current.parents[2] / ".env",
-                current.parents[1] / ".env",
-                current.parent / ".env",
-                Path.cwd() / ".env",
-            ]
-        )
-
-    seen: set[str] = set()
-    for env_path in candidates:
-        try:
-            env_resolved = str(env_path.resolve())
-        except Exception:
-            env_resolved = str(env_path)
-
-        if env_resolved in seen:
-            continue
-        seen.add(env_resolved)
-
-        logger.info("checking .env candidate | path=%s", env_path)
-
-        try:
-            if env_path.exists():
-                load_dotenv(env_path, override=False)
-                logger.info("loaded .env | path=%s", env_path)
-                logger.info(
-                    "OPENAI_API_KEY present after load: %s",
-                    bool(os.getenv("OPENAI_API_KEY")),
-                )
-                return
-        except Exception as e:
-            logger.warning("failed loading .env | path=%s | reason=%s", env_path, e)
-
-    logger.warning("no .env file loaded from any candidate path")
-
-
 
 FRONTEND_DIR = Path(os.getenv("AW_FRONTEND_DIR", str(BASE_DIR / "frontend")))
 DATA_DIR = Path(os.getenv("AW_DATA_DIR", str(BASE_DIR / "data")))
@@ -157,15 +56,15 @@ DEFAULT_PREVIEW_ROWS = int(os.getenv("AW_DEFAULT_PREVIEW_ROWS", "50"))
 MAX_PREVIEW_ROWS = int(os.getenv("AW_MAX_PREVIEW_ROWS", "200"))
 MAX_EXPORT_ROWS = int(os.getenv("AW_MAX_EXPORT_ROWS", "200000"))
 
-# Startup confirmation â€” logged once at import time
+# Startup confirmation — logged once at import time
 logger.info(
     "app started | mode=%s | exports_dir=%s",
     "packaged" if getattr(sys, "frozen", False) else "dev",
     EXPORTS_DIR,
 )
-from app.ai.routes import router as ai_router
 
-app.include_router(ai_router)
+
+
 
 # ============================================================
 # Presets loading (6B)
@@ -1602,20 +1501,3 @@ def api_shutdown(bg: BackgroundTasks):
 
     bg.add_task(_stop)
     return {"ok": True}
-
-@app.get("/api/debug/env")
-def api_debug_env():
-    exe_dir = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else None
-    raw_key = os.environ.get("OPENAI_API_KEY")
-    return {
-        "frozen": bool(getattr(sys, "frozen", False)),
-        "cwd": str(Path.cwd()),
-        "exe_dir": str(exe_dir) if exe_dir else None,
-        "base_dir": str(BASE_DIR),
-        "openai_key_present": bool(raw_key),
-        "openai_key_is_none": raw_key is None,
-        "openai_key_length": len(raw_key) if raw_key is not None else None,
-        "cwd_env_exists": (Path.cwd() / ".env").exists(),
-        "exe_env_exists": (exe_dir / ".env").exists() if exe_dir else False,
-        "base_env_exists": (BASE_DIR / ".env").exists(),
-    }
