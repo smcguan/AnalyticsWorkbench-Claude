@@ -7,9 +7,7 @@ echo.
 
 cd /d "%~dp0"
 
-git branch --show-current > "%temp%\git_branch_tmp.txt"
-set /p CURRENT_BRANCH=<"%temp%\git_branch_tmp.txt"
-del "%temp%\git_branch_tmp.txt" >nul 2>&1
+for /f "delims=" %%i in ('git branch --show-current') do set CURRENT_BRANCH=%%i
 
 if /I not "%CURRENT_BRANCH%"=="main" (
     echo ERROR: Current branch is "%CURRENT_BRANCH%".
@@ -21,6 +19,17 @@ if /I not "%CURRENT_BRANCH%"=="main" (
 echo Current branch: %CURRENT_BRANCH%
 echo.
 
+echo Syncing with origin/main first...
+git pull origin main
+
+if errorlevel 1 (
+    echo.
+    echo Pull failed. Resolve that first before pushing.
+    pause
+    exit /b 1
+)
+
+echo.
 git status
 echo.
 
@@ -52,6 +61,6 @@ if errorlevel 1 (
 )
 
 echo.
-echo == Push to main complete. ==
+echo Push to main complete.
 pause
 endlocal
