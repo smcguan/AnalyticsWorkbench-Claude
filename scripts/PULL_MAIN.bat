@@ -2,43 +2,61 @@
 setlocal
 
 echo.
-echo === PULL MAIN ===
+echo =====================================
+echo        PULL ANALYTICS WORKBENCH
+echo =====================================
 echo.
 
-cd /d "%~dp0"
+REM Repo is the parent of this scripts folder
+cd /d "%~dp0.."
+
+if errorlevel 1 (
+    echo ERROR: Could not access repo directory.
+    pause
+    exit /b 1
+)
+
+git rev-parse --is-inside-work-tree >nul 2>&1
+if errorlevel 1 (
+    echo ERROR: Parent directory is not a git repository.
+    pause
+    exit /b 1
+)
 
 for /f "delims=" %%i in ('git branch --show-current') do set CURRENT_BRANCH=%%i
 
 if /I not "%CURRENT_BRANCH%"=="main" (
-    echo ERROR: Current branch is "%CURRENT_BRANCH%".
+    echo ERROR: You are on branch "%CURRENT_BRANCH%".
     echo Switch to main before pulling.
     pause
     exit /b 1
 )
 
-echo Current branch: %CURRENT_BRANCH%
+echo Repo:
+git rev-parse --show-toplevel
+echo Branch: %CURRENT_BRANCH%
 echo.
 
-git status
-echo.
-
-choice /M "Continue with pull from origin/main"
-if errorlevel 2 (
-    echo Pull cancelled.
-    pause
-    exit /b 0
-)
-
-git pull origin main
-
+echo Fetching origin...
+git fetch origin
 if errorlevel 1 (
-    echo.
-    echo Pull failed.
+    echo ERROR: Fetch failed.
     pause
     exit /b 1
 )
 
 echo.
-echo Pull from main complete.
+echo Pulling origin/main...
+git pull origin main
+if errorlevel 1 (
+    echo ERROR: Pull failed.
+    pause
+    exit /b 1
+)
+
+echo.
+echo Pull successful.
+git log --oneline -3
+echo.
 pause
 endlocal
