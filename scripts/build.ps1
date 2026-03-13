@@ -36,11 +36,11 @@ function Fail {
     exit 1
 }
 
-$Root = Split-Path -Parent $MyInvocation.MyCommand.Path
-if (-not $Root) {
-    $Root = (Get-Location).Path
-}
+# Determine repo root (script lives in /scripts)
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$Root = Resolve-Path (Join-Path $ScriptDir "..")
 
+Set-Location $Root
 Set-Location $Root
 
 $AppName = "AnalyticsWorkbench"
