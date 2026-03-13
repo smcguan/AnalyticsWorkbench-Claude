@@ -7,6 +7,18 @@ echo        PUSH ANALYTICS WORKBENCH
 echo =====================================
 echo.
 
+echo.
+echo SCRIPT LOCATION: %~dp0
+echo REPO TARGET: %REPO%
+echo CURRENT DIRECTORY BEFORE CD: %CD%
+echo.
+cd /d "%REPO%"
+echo CURRENT DIRECTORY AFTER CD: %CD%
+echo.
+git branch --show-current
+git remote -v
+git status
+
 for %%I in ("%~dp0..") do set "REPO=%%~fI"
 cd /d "%REPO%"
 
@@ -112,6 +124,16 @@ git rev-parse HEAD
 echo Remote origin/main:
 git rev-parse origin/main
 echo.
+
+
+echo.
+echo LOCAL HEAD:
+git rev-parse HEAD
+echo REMOTE HEAD:
+git rev-parse origin/main
+git log --oneline -1
+echo.
+pause
 
 echo Push successful.
 pause

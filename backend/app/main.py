@@ -89,6 +89,33 @@ AI can:
 
 But the user remains in control of execution.
 
+IMPORTANT SQL EXECUTION CONVENTION
+----------------------------------
+The SQL execution layer ultimately runs queries against a
+local Parquet file, not against a persistent DuckDB table.
+
+To keep the workflow simple, the SQL editor / AI layer
+should generally write SQL against a logical source table:
+
+    dataset
+
+Example:
+    SELECT * FROM dataset LIMIT 5
+
+At execution time, this file rewrites that logical table
+reference to:
+
+    read_parquet('...actual path...')
+
+For resilience, the execution layer also supports SQL that
+uses the currently selected dataset name in FROM/JOIN
+clauses, such as:
+
+    SELECT * FROM sample LIMIT 5
+
+This prevents mismatches between AI-generated SQL and the
+backend execution path.
+
 ============================================================
 """
 
@@ -843,6 +870,100 @@ def _validate_readonly_sql(sql: str) -> str:
     return s
 
 
+def _strip_trailing_semicolon(sql: str) -> str:
+    """
+    Normalize SQL before we wrap it inside another query.
+
+    WHY THIS EXISTS
+    ---------------
+    The SQL execution endpoint wraps user SQL like this:
+
+        SELECT * FROM (<user_sql>) t LIMIT 200
+
+    If the user SQL ends with a semicolon, DuckDB will reject
+    the wrapped version:
+
+        SELECT * FROM (SELECT ...;) t LIMIT 200
+
+    So we strip trailing semicolons before wrapping.
+    """
+    cleaned = (sql or "").strip()
+    while cleaned.endswith(";"):
+        cleaned = cleaned[:-1].rstrip()
+    return cleaned
+
+
+def _rewrite_sql_dataset_reference(
+    sql: str,
+    dataset_name: str,
+    parquet_sql: str,
+) -> str:
+    """
+    Rewrite logical dataset references to read_parquet(...).
+
+    SUPPORTED INPUT PATTERNS
+    ------------------------
+    We support two ways SQL may refer to the selected dataset:
+
+    1. Preferred logical placeholder:
+           FROM dataset
+           JOIN dataset
+
+    2. Backward-compatible selected dataset name:
+           FROM sample
+           JOIN sample
+
+    This avoids runtime failures when older generated SQL uses
+    the selected dataset name directly instead of the logical
+    placeholder.
+
+    IMPORTANT
+    ---------
+    We only rewrite dataset references in FROM/JOIN clauses.
+    That avoids accidental replacements in column names,
+    aliases, or free text.
+    """
+    rewritten = sql
+    replaced_any = False
+
+    identifiers_to_match = ["dataset", dataset_name]
+
+    for ident in identifiers_to_match:
+        if not ident:
+            continue
+
+        # Match:
+        #   FROM dataset
+        #   JOIN dataset
+        #   FROM "dataset"
+        #   JOIN "sample"
+        #
+        # We replace only the relation token following FROM/JOIN.
+        pattern = re.compile(
+            rf'(?i)\b(from|join)\s+(")?{re.escape(ident)}(")?\b'
+        )
+
+        def _repl(match: re.Match[str]) -> str:
+            nonlocal replaced_any
+            replaced_any = True
+            keyword = match.group(1)
+            return f"{keyword} {parquet_sql}"
+
+        rewritten = pattern.sub(_repl, rewritten)
+
+    if not replaced_any:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "SQL must reference the selected dataset using "
+                "FROM dataset / JOIN dataset "
+                f"or FROM {dataset_name} / JOIN {dataset_name}."
+            ),
+        )
+
+    return rewritten
+
+
 # ============================================================
 # DATASET CONTEXT BUILDING
 # ------------------------------------------------------------
@@ -1431,6 +1552,20 @@ def api_sql(req: SqlRequest):
         user review/edit
             ↓
         Run SQL
+
+    EXECUTION RULE
+    --------------
+    The SQL is expected to reference the selected dataset
+    logically, either as:
+
+        FROM dataset
+
+    or, for backward compatibility:
+
+        FROM <selected_dataset_name>
+
+    Before execution, this route rewrites that logical
+    reference to read_parquet('...actual path...').
     """
     t0 = time.perf_counter()
 
@@ -1441,11 +1576,53 @@ def api_sql(req: SqlRequest):
                 detail=f"Dataset not found: {req.dataset}",
             )
 
+        # ----------------------------------------------------
+        # STEP 1
+        # Validate that the SQL is read-only.
+        # ----------------------------------------------------
         validated_sql = _validate_readonly_sql(req.sql)
+
+        # ----------------------------------------------------
+        # STEP 2
+        # Normalize the SQL before we wrap it. This strips any
+        # trailing semicolon so wrapped preview queries do not
+        # fail with parser errors.
+        # ----------------------------------------------------
+        cleaned_sql = _strip_trailing_semicolon(validated_sql)
+
+        # ----------------------------------------------------
+        # STEP 3
+        # Resolve the selected dataset to its actual parquet
+        # source path.
+        # ----------------------------------------------------
         src, _is_glob = dataset_source_path(req.dataset)
         esc = _sql_escape_path(src)
+        parquet_sql = f"read_parquet('{esc}')"
 
-        sql = validated_sql.replace("dataset", f"read_parquet('{esc}')")
+        # ----------------------------------------------------
+        # STEP 4
+        # Rewrite logical dataset references in FROM / JOIN
+        # clauses to the actual parquet source.
+        #
+        # Supported inputs:
+        #   FROM dataset
+        #   FROM sample
+        #   JOIN dataset
+        #   JOIN sample
+        #
+        # where "sample" is the selected dataset id.
+        # ----------------------------------------------------
+        sql = _rewrite_sql_dataset_reference(
+            sql=cleaned_sql,
+            dataset_name=req.dataset,
+            parquet_sql=parquet_sql,
+        )
+
+        # ----------------------------------------------------
+        # STEP 5
+        # Wrap the user SQL in an outer SELECT so we can safely
+        # limit the preview result shown in the UI.
+        # ----------------------------------------------------
         limited_sql = f"SELECT * FROM ({sql}) t LIMIT {MAX_PREVIEW_ROWS}"
 
         con = _connect()
@@ -1490,6 +1667,24 @@ def api_sql(req: SqlRequest):
             }
         )
         raise
+
+    except duckdb.Error as e:
+        # ----------------------------------------------------
+        # IMPORTANT UX IMPROVEMENT
+        # ----------------------------------------------------
+        # DuckDB errors should come back as readable 400 errors
+        # to the frontend instead of generic 500 failures.
+        # ----------------------------------------------------
+        logger.exception("sql failed | dataset=%s", req.dataset)
+        _audit_log(
+            {
+                "event": "sql",
+                "status": "error",
+                "dataset": req.dataset,
+                "error": str(e),
+            }
+        )
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
     except Exception as e:
         logger.exception("sql failed | dataset=%s", req.dataset)
