@@ -46,6 +46,15 @@ if errorlevel 1 (
     exit /b 1
 )
 
+echo Installing packaging-sensitive runtime dependencies...
+pip install pyarrow python-multipart
+
+if errorlevel 1 (
+    echo ERROR: Failed installing pyarrow/python-multipart.
+    pause
+    exit /b 1
+)
+
 echo.
 echo Requirements installed successfully.
 echo.

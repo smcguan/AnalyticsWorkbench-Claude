@@ -135,6 +135,7 @@ from pathlib import Path
 import sys
 
 from dotenv import load_dotenv
+from dataclasses import asdict
 
 early_env_candidates = [
     Path.cwd() / ".env",
@@ -169,6 +170,8 @@ from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.responses import Response
+from fastapi import UploadFile, File, Form
+
 
 try:
     from dotenv import load_dotenv
@@ -1878,6 +1881,12 @@ def api_sql_export(req: SqlExportRequest):
         )
         raise HTTPException(status_code=500, detail=str(e)) from e
 
+from app.services.dataset_import import (
+    import_dataset,
+    DatasetImportError,
+)
+
+
 @app.get("/api/audit")
 def api_audit(limit: int = Query(200, ge=1, le=5000)):
     """Return last N audit events (newest first)."""
@@ -2249,7 +2258,51 @@ def api_export(
         )
         raise
 
+@app.post("/api/datasets/import")
+async def import_uploaded_dataset(
+    file: UploadFile = File(...),
+    dataset_name: str | None = Form(None),
+):
+    """
+    Import an uploaded dataset and normalize it into the app's canonical
+    dataset storage structure.
+    """
 
+    clean_dataset_name = dataset_name
+    if clean_dataset_name is not None:
+        clean_dataset_name = clean_dataset_name.strip()
+        if not clean_dataset_name or clean_dataset_name.lower() == "string":
+            clean_dataset_name = None
+
+    try:
+        result = import_dataset(
+            uploaded_file=file.file,
+            original_filename=file.filename,
+            display_name=clean_dataset_name,
+            registered_root=DATASETS_DIR,
+        )
+    except DatasetImportError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Dataset import failed: {exc}",
+        ) from exc
+
+    metadata = result.metadata
+
+    return {
+        "dataset": metadata.registered_name,
+        "dataset_id": metadata.dataset_id,
+        "display_name": metadata.display_name,
+        "original_filename": metadata.original_filename,
+        "original_type": metadata.original_type,
+        "parquet_path": metadata.parquet_path,
+        "row_count": metadata.row_count,
+        "column_count": metadata.column_count,
+        "columns": [asdict(col) for col in metadata.columns],
+        "created_at": metadata.created_at,
+    }
 @app.post("/api/datasets/scan")
 def scan_for_parquet(req: ScanRequest):
     """Scan a folder for parquet files and return basic file metadata."""
